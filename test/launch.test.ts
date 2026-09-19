@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { after, test } from "node:test";
 import { createFakeAgent } from "./helpers/fake-agent.ts";
-import { runTap, startTap, type SessionResult, type TapSession } from "./helpers/run-tap.ts";
+import { runTap, startTap, type TapSessionResult, type TapSession } from "./helpers/run-tap.ts";
 
 const agent = createFakeAgent();
 after(() => agent.remove());
@@ -23,8 +23,8 @@ function env(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   return { PATH: agent.pathEnv, ...extra };
 }
 
-/** Waits for the session to freeze, then ends it the way a user would. */
-async function endFrozenSession(session: TapSession): Promise<SessionResult> {
+/** Waits for the session to freeze, then quits it the way a user would. */
+async function quitFrozenSession(session: TapSession): Promise<TapSessionResult> {
   await session.waitForError(/frozen/);
   session.interrupt();
   return session.exited;
@@ -36,7 +36,7 @@ test("launch claude runs the agent with no arguments of Tap's own", async () => 
     env: env({ FAKE_AGENT_ARGV_FILE: argv.path, FAKE_AGENT_EXIT: "0" }),
   });
 
-  await endFrozenSession(session);
+  await quitFrozenSession(session);
 
   assert.deepEqual(argv.read(), []);
 });
@@ -47,7 +47,7 @@ test("arguments after the agent name are forwarded verbatim", async () => {
     env: env({ FAKE_AGENT_ARGV_FILE: argv.path, FAKE_AGENT_EXIT: "0" }),
   });
 
-  await endFrozenSession(session);
+  await quitFrozenSession(session);
 
   assert.deepEqual(argv.read(), ["--model", "opus", "--resume"]);
 });
@@ -58,7 +58,7 @@ test("launch with no agent named runs claude, forwarding its arguments", async (
     env: env({ FAKE_AGENT_ARGV_FILE: argv.path, FAKE_AGENT_EXIT: "0" }),
   });
 
-  await endFrozenSession(session);
+  await quitFrozenSession(session);
 
   assert.deepEqual(argv.read(), ["--model", "opus"]);
 });
@@ -95,7 +95,7 @@ test("Tap writes nothing to the terminal while the agent is running", async () =
   assert.equal(session.stderr(), "", "tap must not speak over the agent");
 
   session.type("exit 0");
-  await endFrozenSession(session);
+  await quitFrozenSession(session);
 });
 
 test("Ctrl+C interrupts the agent while Tap stays up, and a second one ends Tap", async () => {
@@ -117,7 +117,7 @@ test("an agent's exit code is reported, and is distinguishable from a signal", a
     env: env({ FAKE_AGENT_EXIT: "3" }),
   });
 
-  const result = await endFrozenSession(session);
+  const result = await quitFrozenSession(session);
 
   assert.match(result.stderr, /^tap: claude exited with code 3$/m);
   assert.doesNotMatch(result.stderr, /SIG/);
@@ -136,14 +136,14 @@ test("concurrent sessions do not interfere with one another", async () => {
   ];
   await Promise.all(sessions.map((session) => session.waitForOutput(/agent: ready/)));
 
-  // Ending one must leave the other running and unchanged.
+  // Quitting one must leave the other running and unchanged.
   sessions[0]!.type("exit 7");
-  const ended = await endFrozenSession(sessions[0]!);
-  assert.match(ended.stderr, /exited with code 7/);
+  const quit = await quitFrozenSession(sessions[0]!);
+  assert.match(quit.stderr, /exited with code 7/);
   assert.equal(sessions[1]!.stderr(), "");
 
   sessions[1]!.type("exit 0");
-  const survivor = await endFrozenSession(sessions[1]!);
+  const survivor = await quitFrozenSession(sessions[1]!);
 
   assert.match(survivor.stderr, /exited with code 0/);
   assert.deepEqual(first.read(), ["--first"]);

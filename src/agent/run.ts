@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { withSigintIgnored } from "../signals.ts";
+import type { Invocation } from "./claude.ts";
 
 /**
  * How an agent process ended. Exit code and signal are kept apart because a
@@ -13,10 +13,7 @@ export interface AgentOutcome {
   readonly signal: NodeJS.Signals | null;
 }
 
-/**
- * How the agent's end reads to a human. Exit code and signal stay separate: a
- * signal is how an interactive session normally ends, not a failure.
- */
+/** How an agent's end reads to a human. */
 export function describeOutcome(command: string, outcome: AgentOutcome): string {
   if (outcome.signal !== null) return `${command} was terminated by ${outcome.signal}`;
   return `${command} exited with code ${outcome.code ?? 0}`;
@@ -41,21 +38,17 @@ export class AgentNotFoundError extends Error {
  * — a native dependency Tap has no use for. Tap writes nothing while the agent
  * runs, so its output can never interleave with the agent's.
  */
-export function runAgent(
-  command: string,
-  args: readonly string[],
-): Promise<AgentOutcome> {
-  return withSigintIgnored(
-    () =>
-      new Promise<AgentOutcome>((resolve, reject) => {
-        const child = spawn(command, args, { stdio: "inherit" });
+export function runAgent(invocation: Invocation): Promise<AgentOutcome> {
+  return new Promise<AgentOutcome>((resolve, reject) => {
+    const child = spawn(invocation.command, invocation.args, { stdio: "inherit" });
 
-        child.on("error", (error: NodeJS.ErrnoException) => {
-          reject(error.code === "ENOENT" ? new AgentNotFoundError(command) : error);
-        });
-        child.on("close", (code, signal) => {
-          resolve({ code, signal });
-        });
-      }),
-  );
+    child.on("error", (error: NodeJS.ErrnoException) => {
+      reject(
+        error.code === "ENOENT" ? new AgentNotFoundError(invocation.command) : error,
+      );
+    });
+    child.on("close", (code, signal) => {
+      resolve({ code, signal });
+    });
+  });
 }

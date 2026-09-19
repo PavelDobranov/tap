@@ -10,8 +10,7 @@ export interface Command {
   /** The command line as a user would type it, shown in the usage screen. */
   readonly synopsis: string;
   readonly summary: string;
-  /** Absent until the milestone that implements the command. */
-  readonly run?: Handler;
+  readonly run: Handler;
 }
 
 /**

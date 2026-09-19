@@ -1,5 +1,5 @@
 import { COMMANDS, commandNames, findCommand } from "./commands.ts";
-import { EXIT_FAILURE, EXIT_OK, EXIT_USAGE, type Io } from "./io.ts";
+import { EXIT_OK, EXIT_USAGE, type Io } from "./io.ts";
 import { readVersion } from "../version.ts";
 
 export function usage(): string {
@@ -51,11 +51,6 @@ export async function run(argv: readonly string[], io: Io): Promise<number> {
         `Run 'tap --help' for usage.\n`,
     );
     return EXIT_USAGE;
-  }
-
-  if (command.run === undefined) {
-    io.stderr.write(`tap: ${command.name} is not implemented yet.\n`);
-    return EXIT_FAILURE;
   }
 
   return command.run(argv.slice(1), io);

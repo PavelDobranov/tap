@@ -4,20 +4,20 @@
  */
 const INTERRUPTS = ["SIGINT", "SIGTERM"] as const satisfies readonly NodeJS.Signals[];
 
-const ignore = (): void => {};
+const noop = (): void => {};
 
 /**
- * Runs `body` with SIGINT ignored. Tap and the agent share a process group, so
+ * Stops SIGINT from killing Tap. Tap and the agent share a process group, so
  * Ctrl+C reaches both: ignoring it here leaves the agent to handle its own
  * interrupt and keeps Tap from exiting out from under it.
  */
-export async function withSigintIgnored<T>(body: () => Promise<T>): Promise<T> {
-  process.on("SIGINT", ignore);
-  try {
-    return await body();
-  } finally {
-    process.off("SIGINT", ignore);
-  }
+export function ignoreSigint(): void {
+  process.on("SIGINT", noop);
+}
+
+/** Gives SIGINT back its default handling. */
+export function restoreSigint(): void {
+  process.off("SIGINT", noop);
 }
 
 /**
@@ -25,19 +25,27 @@ export async function withSigintIgnored<T>(body: () => Promise<T>): Promise<T> {
  * its default handling, so a Ctrl+C that ends Tap looks to the shell exactly
  * like a Ctrl+C that ends any other program. Never returns.
  *
+ * Taking over from `ignoreSigint` is done in this order — listen, then stop
+ * ignoring — because the reverse leaves a window in which a Ctrl+C aimed at
+ * the agent would kill Tap instead of freezing the session.
+ *
  * A timer is held open for the duration: a process kept alive only by signal
  * handlers has an event loop Node considers drained, and Node says so on
  * stderr — output Tap has no business producing.
  */
 export function exitOnInterrupt(): Promise<never> {
   return new Promise<never>(() => {
-    const alive = setInterval(ignore, 1 << 30);
+    const alive = setInterval(noop, 1 << 30);
+    const handlers = new Map<NodeJS.Signals, () => void>();
     for (const signal of INTERRUPTS) {
-      process.on(signal, () => {
+      const handler = (): void => {
         clearInterval(alive);
-        for (const other of INTERRUPTS) process.removeAllListeners(other);
+        for (const [other, installed] of handlers) process.off(other, installed);
         process.kill(process.pid, signal);
-      });
+      };
+      handlers.set(signal, handler);
+      process.on(signal, handler);
     }
+    restoreSigint();
   });
 }

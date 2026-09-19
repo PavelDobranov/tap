@@ -48,17 +48,3 @@ test("an unrecognised flag exits nonzero with a clear message", async () => {
   assert.notEqual(result.code, 0);
   assert.match(result.stderr, /unknown option: --nope/i);
 });
-
-// Commands whose milestone has not arrived yet; each one moves out of this
-// list as it is implemented. `launch` behaviour lives in launch.test.ts.
-const unimplemented: string[] = [];
-
-for (const command of unimplemented) {
-  test(`${command} is recognised and reports that it is not implemented yet`, async () => {
-    const result = await runTap([command]);
-
-    assert.notEqual(result.code, 0);
-    assert.match(result.stderr, /not implemented yet/i);
-    assert.doesNotMatch(result.stderr, /unknown command/i);
-  });
-}

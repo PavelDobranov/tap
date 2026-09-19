@@ -67,7 +67,7 @@ export function readManifest(): {
   return JSON.parse(readFileSync(new URL("package.json", repoRoot), "utf8"));
 }
 
-export interface SessionResult {
+export interface TapSessionResult {
   stdout: string;
   stderr: string;
   /** Null when the process was killed by a signal. */
@@ -91,7 +91,7 @@ export interface TapSession {
   waitForOutput(pattern: RegExp): Promise<void>;
   /** Resolves once `pattern` has appeared in stderr; rejects on a timeout. */
   waitForError(pattern: RegExp): Promise<void>;
-  exited: Promise<SessionResult>;
+  exited: Promise<TapSessionResult>;
 }
 
 const WAIT_TIMEOUT_MS = 10_000;
@@ -130,7 +130,7 @@ export function startTap(
     for (const notify of watchers) notify();
   });
 
-  const exited = new Promise<SessionResult>((resolve) => {
+  const exited = new Promise<TapSessionResult>((resolve) => {
     child.on("close", (code, signal) => {
       resolve({ stdout, stderr, code, signal });
     });

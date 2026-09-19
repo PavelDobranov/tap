@@ -3,16 +3,12 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 
 /**
- * A fake agent executable on its own `PATH` entry. Agents resolve by name
+ * A fake `claude` executable on its own `PATH` entry. Agents resolve by name
  * through `PATH`, so this is the real resolution path rather than a test-only
  * hook: shadowing `claude` with a script is how the suite gets a Claude Code
  * that does what a test needs.
  */
 export interface FakeAgent {
-  /** The directory to prepend to `PATH`. */
-  readonly dir: string;
-  /** The executable itself, for assertions that want the absolute path. */
-  readonly executable: string;
   /** A `PATH` with this agent shadowing any real one, for a child's env. */
   readonly pathEnv: string;
   remove(): void;
@@ -43,22 +39,18 @@ createInterface({ input: process.stdin }).on("line", (line) => {
 });
 `;
 
-export function createFakeAgent(
-  options: { name?: string; body?: string } = {},
-): FakeAgent {
-  const name = options.name ?? "claude";
-  const dir = path.join(mkdtempSync(path.join(tmpdir(), "tap-fake-agent-")), "bin");
+/** Writes a fake `claude`, whose body a caller may replace wholesale. */
+export function createFakeAgent(body: string = INTERACTIVE_AGENT): FakeAgent {
+  const root = mkdtempSync(path.join(tmpdir(), "tap-fake-agent-"));
+  const dir = path.join(root, "bin");
   mkdirSync(dir, { recursive: true });
 
-  const executable = path.join(dir, name);
-  writeFileSync(executable, `#!/usr/bin/env node\n${options.body ?? INTERACTIVE_AGENT}`, {
+  writeFileSync(path.join(dir, "claude"), `#!/usr/bin/env node\n${body}`, {
     mode: 0o755,
   });
 
   return {
-    dir,
-    executable,
     pathEnv: `${dir}${path.delimiter}${process.env.PATH ?? ""}`,
-    remove: () => rmSync(path.dirname(dir), { recursive: true, force: true }),
+    remove: () => rmSync(root, { recursive: true, force: true }),
   };
 }
