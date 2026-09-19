@@ -4,7 +4,7 @@
 // a native binding — rests on this staying true, so it is checked rather than
 // assumed.
 import { execFileSync } from "node:child_process";
-import { readFileSync, readdirSync, statSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -18,7 +18,7 @@ function productionPackageDirs() {
   const raw = execFileSync("npm", ["ls", "--omit=dev", "--all", "--json", "--long"], {
     cwd: root,
     encoding: "utf8",
-    stdio: ["ignore", "pipe", "ignore"],
+    stdio: ["ignore", "pipe", "inherit"],
   });
   const dirs = new Set();
   const visit = (node) => {
@@ -54,7 +54,11 @@ function nativeArtefacts(dir) {
   return found;
 }
 
+const rootManifest = JSON.parse(readFileSync(path.join(root, "package.json"), "utf8"));
+const declared = new Set(Object.keys(rootManifest.dependencies ?? {}));
+
 const problems = [];
+const seen = new Set();
 for (const dir of productionPackageDirs()) {
   let manifest;
   try {
@@ -63,6 +67,7 @@ for (const dir of productionPackageDirs()) {
     continue;
   }
   const name = manifest.name ?? path.relative(root, dir);
+  seen.add(name);
   for (const hook of INSTALL_HOOKS) {
     if (manifest.scripts?.[hook]) {
       problems.push(`${name}: has a ${hook} script (${manifest.scripts[hook]})`);
@@ -74,11 +79,11 @@ for (const dir of productionPackageDirs()) {
   }
 }
 
-// Sanity check: the dependency tree must actually have been resolved.
-try {
-  statSync(path.join(root, "package.json"));
-} catch {
-  problems.push("no package.json at the repository root");
+// Without this, an uninstalled node_modules would make the scan pass vacuously.
+for (const dependency of declared) {
+  if (!seen.has(dependency)) {
+    problems.push(`${dependency}: declared but not installed — run 'npm install' first`);
+  }
 }
 
 if (problems.length > 0) {

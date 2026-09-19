@@ -1,11 +1,8 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
 import { test } from "node:test";
-import { runTap } from "./helpers/run-tap.ts";
+import { readManifest, runTap } from "./helpers/run-tap.ts";
 
-const pkg = JSON.parse(
-  readFileSync(new URL("../package.json", import.meta.url), "utf8"),
-) as { version: string };
+const pkg = readManifest();
 
 const commands = ["launch", "list", "show", "export", "rm"];
 

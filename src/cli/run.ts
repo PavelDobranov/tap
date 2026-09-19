@@ -18,7 +18,7 @@ export function usage(): string {
     "Commands:",
   ];
   for (const command of COMMANDS) {
-    lines.push(`  ${command.usage}`, `      ${command.summary}`);
+    lines.push(`  ${command.synopsis}`, `      ${command.summary}`);
   }
   lines.push(
     "",
@@ -35,7 +35,7 @@ export function usage(): string {
  * exiting, so the entry point owns process control and tests do not have to.
  */
 export async function run(argv: readonly string[], io: Io): Promise<number> {
-  const [first, ...rest] = argv;
+  const first = argv[0];
 
   if (first === undefined || first === "--help" || first === "-h") {
     io.stdout.write(usage());
@@ -62,14 +62,8 @@ export async function run(argv: readonly string[], io: Io): Promise<number> {
     return EXIT_USAGE;
   }
 
-  return await dispatch(command.name, rest, io);
-}
-
-async function dispatch(
-  name: string,
-  _args: readonly string[],
-  io: Io,
-): Promise<number> {
-  io.stderr.write(`tap: ${name} is not implemented yet.\n`);
+  // Later milestones replace this with the command's own handler, passing it
+  // argv.slice(1).
+  io.stderr.write(`tap: ${command.name} is not implemented yet.\n`);
   return EXIT_FAILURE;
 }
