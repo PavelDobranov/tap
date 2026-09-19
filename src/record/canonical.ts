@@ -50,3 +50,18 @@ function spell(value: unknown): string {
 export function contentHash(value: unknown): string {
   return createHash("sha256").update(canonicalJson(value)).digest("hex");
 }
+
+/**
+ * The address of bytes there is no value to canonicalise: a unit that would
+ * not parse, so `contentHash` has nothing to spell. SHA-256 of the bytes
+ * themselves, marked so it can never be mistaken for — or collide with — a
+ * content hash.
+ *
+ * Not a blob address, and never used as one. A blob is addressed by its
+ * content and nothing else; this is only for asking whether two units that
+ * could not be read are the same bytes, which is what thread attribution
+ * needs from a message it cannot parse.
+ */
+export function textAddress(text: string): string {
+  return `text:${createHash("sha256").update(text).digest("hex")}`;
+}

@@ -174,9 +174,12 @@ for reading and never hide a request.
 _Avoid_: exchange, round, interaction, conversation turn
 
 **Subagent invocation**:
-A tool-use block observed in a captured response. It is a *fact* about a
-delegation, as opposed to thread attribution, which is an inference — the
-distinction is why "subagent" is not a thread label.
+A tool-use block observed in a captured response, naming a tool Claude Code
+starts a subagent with. That the block was there is a *fact*, as opposed to
+thread attribution, which is an inference — the distinction is why "subagent"
+is not a thread label. Every tool-use block a response carried is held and the
+subagent ones are marked, so recognising the tool by name can cost a mark and
+can never cost the record the block itself.
 _Avoid_: subagent, subagent session, delegation
 
 ### The viewer

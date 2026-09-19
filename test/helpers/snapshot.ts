@@ -10,6 +10,12 @@ import { request } from "node:http";
 export interface SnapshotRequest {
   seq: number;
   type: "messages" | "count_tokens" | "other";
+  /**
+   * The conversation lineage the request continues, numbered from 1 in order
+   * of first appearance, or null when it carried no messages. Thread 1 is the
+   * main thread.
+   */
+  thread: number | null;
   method: string;
   endpoint: string;
   model: string | null;
@@ -26,6 +32,11 @@ export interface SnapshotRequest {
   rawResponse: string[];
   /** Whether the response ended without the upstream closing it cleanly. */
   interrupted: boolean;
+  /**
+   * The tool-use blocks the response carried, in the order it opened them,
+   * each saying whether it is a subagent invocation.
+   */
+  toolUses: { id: string; tool: string; subagentInvocation: boolean }[];
   usage: {
     inputTokens?: number;
     outputTokens?: number;
@@ -65,8 +76,17 @@ export interface SnapshotDiagnostic {
   detail: string;
 }
 
+/** One conversation lineage, as the snapshot presents it. */
+export interface SnapshotThread {
+  id: number;
+  /** Whether this is the first thread of the session: the main thread. */
+  main: boolean;
+  firstSeq: number;
+}
+
 export interface Snapshot {
   requests: SnapshotRequest[];
+  threads: SnapshotThread[];
   blobs: { [hash: string]: SnapshotBlob };
   storage: SnapshotStorage;
   diagnostics: SnapshotDiagnostic[];

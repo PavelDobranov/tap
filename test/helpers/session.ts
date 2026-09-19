@@ -33,11 +33,22 @@ export type Await =
   /** As soon as the UI URL is printed, with the requests still to come. */
   | "url";
 
+/** How a session is driven, where the default is not what a test is about. */
+export interface ProbeOptions {
+  /**
+   * Fires every step at once instead of one after another, so the requests
+   * overlap on the wire. Their order at the proxy is then the network's to
+   * decide, which is the point.
+   */
+  readonly concurrently?: boolean;
+}
+
 export interface Prober {
   probe(
     script: readonly ProbeStep[],
     upstreamBaseUrl: string,
     until?: Await,
+    options?: ProbeOptions,
   ): Promise<Probed>;
   /** A fake upstream, torn down with the prober. */
   upstream(plan: UpstreamPlan): Promise<FakeUpstream>;
@@ -62,7 +73,7 @@ export function createProber(name: string): Prober {
       return server;
     },
 
-    async probe(script, upstreamBaseUrl, until = "frozen") {
+    async probe(script, upstreamBaseUrl, until = "frozen", options = {}) {
       const file = path.join(scratch, `probe-${files++}.json`);
       const session = await startLaunch(["claude"], {
         env: {
@@ -71,6 +82,7 @@ export function createProber(name: string): Prober {
           FAKE_AGENT_PROBE_FILE: file,
           FAKE_AGENT_PROBE_SCRIPT: JSON.stringify(script),
           ...(until === "transcript" ? { FAKE_AGENT_PROBE_STAY: "1" } : {}),
+          ...(options.concurrently === true ? { FAKE_AGENT_PROBE_CONCURRENTLY: "1" } : {}),
         },
       });
 

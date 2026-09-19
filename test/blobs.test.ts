@@ -16,8 +16,7 @@ import type { RequestType } from "../src/record/record.ts";
 /** Round-trips a payload through a fresh store, as a snapshot reader would. */
 function roundTrip(payload: string, type: RequestType = "messages"): string {
   const blobs = createBlobs();
-  const skeleton = blobs.store(payload, type);
-  assert.ok(skeleton !== null);
+  const { skeleton } = blobs.store(payload, type);
   return reconstruct(skeleton, blobs.map());
 }
 
@@ -49,7 +48,7 @@ test("system, tools and each message are addressed in their own right", () => {
     ],
   });
 
-  const skeleton = blobs.store(payload, "messages");
+  const { skeleton } = blobs.store(payload, "messages");
   const referenced = skeleton.filter((part) => typeof part !== "string");
   assert.equal(referenced.length, 4, "system, tools and two messages");
   assert.equal(Object.keys(blobs.map()).length, 4);
@@ -67,7 +66,7 @@ test("the same conversation resent holds one blob per distinct unit, not per req
     messages.push({ role: "user", content: `ask ${turn}` });
     messages.push({ role: "assistant", content: `answer ${turn}` });
     const payload = JSON.stringify({ model: "claude-opus-5", system, tools, messages });
-    skeletons.push(blobs.store(payload, "messages"));
+    skeletons.push(blobs.store(payload, "messages").skeleton);
   }
 
   const storage = blobs.storage();
@@ -88,11 +87,16 @@ test("a moved cache_control breakpoint does not make a second blob of the same m
 
   const first = blobs.store(JSON.stringify({ messages: [plain] }), "messages");
   const second = blobs.store(JSON.stringify({ messages: [marked] }), "messages");
+  assert.deepEqual(
+    first.messageAddresses,
+    second.messageAddresses,
+    "and the message addresses the record hands out are the same one",
+  );
 
   assert.equal(Object.keys(blobs.map()).length, 1, "the breakpoint is not part of the content");
-  assert.equal(reconstruct(first, blobs.map()), JSON.stringify({ messages: [plain] }));
+  assert.equal(reconstruct(first.skeleton, blobs.map()), JSON.stringify({ messages: [plain] }));
   assert.equal(
-    reconstruct(second, blobs.map()),
+    reconstruct(second.skeleton, blobs.map()),
     JSON.stringify({ messages: [marked] }),
     "and the breakpoint comes back exactly where it was",
   );
@@ -110,7 +114,11 @@ test("a breakpoint is put back wherever it sat in the message", () => {
   const blobs = createBlobs();
   for (const message of cases) {
     const payload = JSON.stringify({ messages: [message] });
-    assert.equal(reconstruct(blobs.store(payload, "messages"), blobs.map()), payload, payload);
+    assert.equal(
+      reconstruct(blobs.store(payload, "messages").skeleton, blobs.map()),
+      payload,
+      payload,
+    );
   }
   assert.equal(
     Object.keys(blobs.map()).length,
@@ -153,7 +161,7 @@ test("what the store holds is reported, and it is less than it was shown", () =>
 test("a body that is not json at all is still held whole", () => {
   const torn = '{"model":"claude-opus-5",';
   const blobs = createBlobs();
-  const skeleton = blobs.store(torn, "messages");
+  const { skeleton } = blobs.store(torn, "messages");
   assert.deepEqual(skeleton, [torn], "unreadable is not the same as unrecorded");
   assert.equal(blobs.storage().blobCount, 0);
   assert.equal(reconstruct(skeleton, blobs.map()), torn);
@@ -194,7 +202,11 @@ test("reconstruction is byte-exact for arbitrary bodies of the right shape", () 
       tools: value(3),
       messages: Array.from({ length: Math.floor(random() * 5) }, () => value(3)),
     });
-    assert.equal(reconstruct(blobs.store(payload, "messages"), blobs.map()), payload, payload);
+    assert.equal(
+      reconstruct(blobs.store(payload, "messages").skeleton, blobs.map()),
+      payload,
+      payload,
+    );
   }
   assert.ok(blobs.storage().referencedUnits > 1_000, "and the units really were addressed");
 });
@@ -240,6 +252,6 @@ test("a payload nested past what reading it can walk is kept whole, not lost", (
   const payload = `{"messages":[${deep}],"system":"fine"}`;
 
   const blobs = createBlobs();
-  const skeleton = blobs.store(payload, "messages");
+  const { skeleton } = blobs.store(payload, "messages");
   assert.equal(reconstruct(skeleton, blobs.map()), payload);
 });

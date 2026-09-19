@@ -9,6 +9,11 @@ import type { Usage } from "./record.ts";
  * Everything here throws on malformed input rather than returning a quiet
  * null. A stream Tap could not read is a capture failure, and fail-open only
  * works if failure is loud enough to become a diagnostic.
+ *
+ * The readers that answer "what did this object carry" — usage, model, tool
+ * uses — are the exception, and answer nothing where an object carried
+ * nothing. Most response objects carry none of the three, so an absence there
+ * is the ordinary case rather than a failure to read one.
  */
 
 /** The model a request asked for, or null if it named none. */
@@ -61,6 +66,48 @@ export function readResponseModel(value: unknown): string | null {
   const object = asObject(value);
   const model = object?.["model"] ?? asObject(object?.["message"])?.["model"];
   return typeof model === "string" ? model : null;
+}
+
+/** A tool-use block as a response presented it. */
+export interface ToolUse {
+  /** The provider's id for the block, and what makes it one block twice seen. */
+  readonly id: string;
+  readonly name: string;
+}
+
+/**
+ * The tool-use blocks one response object carries, if it carries any.
+ *
+ * Two shapes have them: a `content_block_start` event opening one, and a
+ * whole message whose `content` holds them. A streamed block is reported from
+ * its opening event rather than from its accumulated input, so a subagent
+ * invocation is in the record while its input is still being written — and so
+ * that reading it needs no reassembly of `input_json_delta` fragments.
+ *
+ * A block with no id or no name is not reported: a tool use Tap cannot name
+ * is not a fact worth writing down as one.
+ */
+export function readToolUses(value: unknown): readonly ToolUse[] {
+  const object = asObject(value);
+  if (object === undefined) return [];
+
+  const blocks = [
+    object["content_block"],
+    ...asArray(object["content"]),
+    ...asArray(asObject(object["message"])?.["content"]),
+  ];
+  return blocks.map(asToolUse).filter((block): block is ToolUse => block !== null);
+}
+
+function asToolUse(value: unknown): ToolUse | null {
+  const block = asObject(value);
+  if (block?.["type"] !== "tool_use") return null;
+  const { id, name } = block;
+  return typeof id === "string" && typeof name === "string" ? { id, name } : null;
+}
+
+function asArray(value: unknown): readonly unknown[] {
+  return Array.isArray(value) ? value : [];
 }
 
 /** What one pass over a run of server-sent events found. */

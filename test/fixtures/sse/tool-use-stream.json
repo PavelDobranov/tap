@@ -1,0 +1,30 @@
+{
+  "status": 200,
+  "headers": {
+    "content-type": "text/event-stream; charset=utf-8",
+    "cache-control": "no-cache",
+    "anthropic-request-id": "req_fixture_tool_use_stream"
+  },
+  "chunks": [
+    {
+      "gapMs": 0,
+      "text": "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_fixture_tool_use\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-opus-5\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":312,\"output_tokens\":1}}}\n\n"
+    },
+    {
+      "gapMs": 40,
+      "text": "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_fixture_task\",\"name\":\"Task\",\"input\":{}}}\n"
+    },
+    {
+      "gapMs": 40,
+      "text": "\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"subagent\"}}\n\n"
+    },
+    {
+      "gapMs": 40,
+      "text": "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_fixture_read\",\"name\":\"Read\",\"input\":{}}}\n\n"
+    },
+    {
+      "gapMs": 40,
+      "text": "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":48}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+    }
+  ]
+}

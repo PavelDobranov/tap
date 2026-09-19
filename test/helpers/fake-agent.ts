@@ -99,6 +99,9 @@ export interface ProbeTranscript {
  * Reads `FAKE_AGENT_PROBE_SCRIPT` (a JSON array of steps) and writes
  * `FAKE_AGENT_PROBE_FILE`, then exits — or, with `FAKE_AGENT_PROBE_STAY` set,
  * waits for `exit` on stdin, so a test can inspect a session still running.
+ * With `FAKE_AGENT_PROBE_CONCURRENTLY` set the steps all go at once, which is
+ * how a test gets requests overlapping on the wire; the transcript is then in
+ * completion order rather than script order.
  */
 export const PROBE_AGENT = `
 const { writeFileSync } = require("node:fs");
@@ -164,7 +167,10 @@ function ask(step) {
 }
 
 (async () => {
-  for (const step of script) await ask(step);
+  // In flight together, rather than one after another, when the test is about
+  // what Tap does with requests that overlap.
+  if (process.env.FAKE_AGENT_PROBE_CONCURRENTLY) await Promise.all(script.map(ask));
+  else for (const step of script) await ask(step);
   writeFileSync(process.env.FAKE_AGENT_PROBE_FILE, JSON.stringify(transcript));
   if (!process.env.FAKE_AGENT_PROBE_STAY) process.exit(Number(process.env.FAKE_AGENT_EXIT || "0"));
   require("node:readline")

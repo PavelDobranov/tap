@@ -1,4 +1,4 @@
-import { contentHash } from "./canonical.ts";
+import { contentHash, textAddress } from "./canonical.ts";
 import { locate, type Span } from "./locate.ts";
 import type { RequestType } from "./record.ts";
 
@@ -49,6 +49,27 @@ export interface BlobMap {
   readonly [hash: string]: Blob;
 }
 
+/**
+ * What holding one payload produced: the skeleton to reconstruct it from, and
+ * the address of each of its messages, in wire order.
+ *
+ * The addresses come out of here rather than being computed again elsewhere
+ * because they are the addresses with the annotations already cut. A message
+ * whose only change between two requests is a moved cache breakpoint has one
+ * address, and anything deriving conversation lineage from a second, naive
+ * hash of the same text would see a fork every time Claude Code moved a
+ * breakpoint.
+ */
+export interface Stored {
+  readonly skeleton: Skeleton;
+  /**
+   * One address per element of `messages[]`, in order. Empty for a payload
+   * with no messages in it — an `other` request, a `count_tokens` with none,
+   * or a body that is not a JSON object at all.
+   */
+  readonly messageAddresses: readonly string[];
+}
+
 /** What deduplication is costing and saving. */
 export interface PayloadStorage {
   /** Bytes of payload held: every blob, plus the text left in skeletons. */
@@ -81,7 +102,7 @@ export interface Blobs {
    * Total: a payload that cannot be taken apart becomes a skeleton of one
    * literal part, which is the verbatim behaviour this replaced.
    */
-  store(payload: string, type: RequestType): Skeleton;
+  store(payload: string, type: RequestType): Stored;
   map(): BlobMap;
   storage(): PayloadStorage;
 }
@@ -93,12 +114,17 @@ export function createBlobs(): Blobs {
   let referencedUnits = 0;
 
   /**
-   * Holds one unit, or answers null if it cannot be held as a reference — the
-   * cut text is not JSON, addressing it failed, or its address is already
-   * taken by bytes that are not these. All three leave the unit in the
-   * skeleton verbatim, which costs a duplicate and never costs fidelity.
+   * Holds one unit, and hands back its address and, where it could be held as
+   * a reference, that reference.
+   *
+   * The reference is null when the unit cannot be one — the cut text is not
+   * JSON, addressing it failed, or its address is already taken by bytes that
+   * are not these. All three leave the unit in the skeleton verbatim, which
+   * costs a duplicate and never costs fidelity. The address stands either way:
+   * a unit that could not be deduplicated is still a unit whose content can be
+   * compared with another request's, which is what thread attribution needs.
    */
-  const intern = (payload: string, unit: Span, cuts: readonly Span[]): UnitReference | null => {
+  const intern = (payload: string, unit: Span, cuts: readonly Span[]): Interned => {
     const { json, annotations } = cut(payload, unit, cuts);
 
     let hash: string;
@@ -109,8 +135,10 @@ export function createBlobs(): Blobs {
       // write, so it is the one place that has to survive anything: a body
       // that is not JSON after all, or nested past what a recursive walk of it
       // can take. Neither is a capture failure worth a diagnostic — the bytes
-      // are kept either way, they are just kept twice.
-      return null;
+      // are kept either way, they are just kept twice. The bytes still get an
+      // address, taken from the text rather than from a value nothing could
+      // parse out of it.
+      return { address: textAddress(json), reference: null };
     }
 
     const held = blobs.get(hash);
@@ -122,11 +150,11 @@ export function createBlobs(): Blobs {
       // Two spellings of one content: canonical JSON says they are the same
       // unit, but only one of them can be the bytes this blob hands back.
       // Addressing is an optimisation; the bytes are the record.
-      return null;
+      return { address: hash, reference: null };
     }
 
     referencedUnits += 1;
-    return { blob: hash, annotations };
+    return { address: hash, reference: { blob: hash, annotations } };
   };
 
   return {
@@ -135,9 +163,10 @@ export function createBlobs(): Blobs {
       if (located === null) {
         // Already its own string, so there is nothing to detach it from.
         literalBytes += Buffer.byteLength(payload);
-        return [payload];
+        return { skeleton: [payload], messageAddresses: [] };
       }
 
+      const messageAddresses: string[] = [];
       const parts: SkeletonPart[] = [];
       let literal = "";
       let cursor = 0;
@@ -155,7 +184,8 @@ export function createBlobs(): Blobs {
         const cuts = located.annotations.filter(
           (span) => span.from >= unit.from && span.to <= unit.to,
         );
-        const reference = intern(payload, unit, cuts);
+        const { address, reference } = intern(payload, unit, cuts);
+        if (unit.message) messageAddresses.push(address);
         if (reference === null) {
           literal += payload.slice(unit.from, unit.to);
           continue;
@@ -166,7 +196,7 @@ export function createBlobs(): Blobs {
 
       literal += payload.slice(cursor);
       flush();
-      return parts;
+      return { skeleton: parts, messageAddresses };
     },
 
     map: () => Object.fromEntries(blobs),
@@ -180,6 +210,12 @@ export function createBlobs(): Blobs {
       deduplicationRatio: blobs.size === 0 ? 0 : round(referencedUnits / blobs.size),
     }),
   };
+}
+
+/** A held unit: its address, and the reference standing in for it if it has one. */
+interface Interned {
+  readonly address: string;
+  readonly reference: UnitReference | null;
 }
 
 /** One unit's text with its annotations cut out, and where each one was. */

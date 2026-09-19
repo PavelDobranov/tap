@@ -15,13 +15,25 @@ export interface Span {
   readonly to: number;
 }
 
+/**
+ * One addressable part of a payload, and whether it is conversation.
+ *
+ * A unit says which member it came out of rather than leaving a caller to
+ * work it out from where it sits: a thread is derived from the messages
+ * alone, and `system` and `tools` are configuration resent with every request
+ * rather than conversation lineage.
+ */
+export interface Unit extends Span {
+  readonly message: boolean;
+}
+
 /** Where the addressable parts of one payload are. */
 export interface Located {
   /**
    * The units, ascending and disjoint: the value of `system`, the value of
    * `tools`, and each element of `messages`, whichever of them are there.
    */
-  readonly units: readonly Span[];
+  readonly units: readonly Unit[];
   /**
    * Every `cache_control` member, ascending and disjoint, as the span to cut
    * out — leading comma, trailing comma or neither, so that what is left is
@@ -61,11 +73,11 @@ export function locate(payload: string): Located | null {
   }
   if (scan.at !== payload.length || shape.kind !== "object") return null;
 
-  const units: Span[] = [];
+  const units: Unit[] = [];
   for (const member of shape.members) {
-    if (WHOLE_UNITS.includes(member.key)) units.push(member.value);
+    if (WHOLE_UNITS.includes(member.key)) units.push({ ...member.value, message: false });
     else if (member.key === UNIT_ELEMENTS && member.shape.kind === "array") {
-      units.push(...member.shape.elements);
+      units.push(...member.shape.elements.map((span) => ({ ...span, message: true })));
     }
   }
 
@@ -77,7 +89,7 @@ export function locate(payload: string): Located | null {
  * a `cache_control` nested inside another `cache_control` produces one, and
  * cutting it twice would cut bytes that were already gone.
  */
-function ascending(spans: Span[]): Span[] {
+function ascending<T extends Span>(spans: T[]): T[] {
   const sorted = [...spans].sort((a, b) => a.from - b.from);
   return sorted.filter((span, index) => index === 0 || span.from >= sorted[index - 1]!.to);
 }

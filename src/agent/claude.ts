@@ -5,6 +5,25 @@
  */
 export const CLAUDE = "claude";
 
+/**
+ * The tools Claude Code starts a subagent with. Both names are listed because
+ * the tool has been called both across Claude Code versions, and Tap is
+ * pointed at whichever one the developer has.
+ *
+ * This is the only inference in the way a tool use is recorded, and it is
+ * arranged so that being wrong about it costs a label rather than a fact: the
+ * record holds *every* tool-use block a response carried, and this says which
+ * of them is a subagent invocation. A name that moves therefore leaves the
+ * tool use in the record unmarked, where the next reader can see it, instead
+ * of leaving a session that ran subagents looking like one that ran none.
+ */
+const SUBAGENT_TOOLS: readonly string[] = ["Task", "Agent"];
+
+/** Whether a tool-use block naming this tool is a subagent invocation. */
+export function invokesSubagent(tool: string): boolean {
+  return SUBAGENT_TOOLS.includes(tool);
+}
+
 /** The command line Tap hands to the agent, resolved by name through `PATH`. */
 export interface Invocation {
   readonly command: string;

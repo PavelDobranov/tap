@@ -1,4 +1,5 @@
 import { createBlobs, type BlobMap, type PayloadStorage, type Skeleton } from "./blobs.ts";
+import { createThreads, type Thread } from "./threads.ts";
 
 /**
  * Re-exported so that the snapshot is one interface rather than two: a
@@ -15,6 +16,8 @@ export {
   type SkeletonPart,
   type UnitReference,
 } from "./blobs.ts";
+
+export type { Thread } from "./threads.ts";
 
 /**
  * What a request was recognised as. Every request that reaches the proxy gets
@@ -37,11 +40,44 @@ export interface Usage {
   cacheReadInputTokens?: number;
 }
 
+/**
+ * A tool-use block observed in a captured response.
+ *
+ * A *fact*, and the reason "subagent" is not a thread label: the response
+ * itself said this tool use happened. Which later requests belong to a
+ * subagent invocation is not said here, and is not inferred — the thread those
+ * requests fall in is derived from their prefixes like any other, and is never
+ * joined up to this.
+ */
+export interface ToolUse {
+  /** The provider's id for the tool-use block. */
+  readonly id: string;
+  readonly tool: string;
+  /**
+   * Whether this tool use is a subagent invocation: the tool is one Claude
+   * Code starts a subagent with. Every tool-use block is held either way, so a
+   * tool Tap does not recognise is recorded and left unmarked rather than
+   * dropped — a subagent invocation missing from the record would be read as a
+   * subagent that never ran.
+   */
+  readonly subagentInvocation: boolean;
+}
+
 /** One request in the record, as the snapshot presents it. */
 export interface RecordedRequest {
   /** Position in wire order, from 1. */
   readonly seq: number;
   readonly type: RequestType;
+  /**
+   * The conversation lineage this request continues, numbered from 1 in order
+   * of first appearance, or null when it carried no messages to derive one
+   * from. Thread 1 is the main thread.
+   *
+   * An inference, and a deliberately thin one: it says this request shares a
+   * message prefix with the others in its thread, and nothing about why a
+   * thread began. See `threads.ts`.
+   */
+  readonly thread: number | null;
   readonly method: string;
   /** The request target as it arrived, path and query. */
   readonly endpoint: string;
@@ -83,6 +119,12 @@ export interface RecordedRequest {
    * failure that produces a confident wrong conclusion.
    */
   readonly interrupted: boolean;
+  /**
+   * The tool-use blocks this request's response carried, in the order the
+   * response opened them, each saying whether it is a subagent invocation.
+   * A block appears once however many times the stream reports it.
+   */
+  readonly toolUses: readonly ToolUse[];
 }
 
 /**
@@ -113,6 +155,12 @@ export interface Storage extends PayloadStorage {
 /** The whole record as it stands. */
 export interface Snapshot {
   readonly requests: readonly RecordedRequest[];
+  /**
+   * The conversation lineages seen, in order of first appearance. The first is
+   * the main thread; the rest are numbered and not otherwise named, because
+   * the wire cannot say what they are.
+   */
+  readonly threads: readonly Thread[];
   /**
    * Every unit the record holds, once each, by content hash. This is where
    * the payloads actually are: a skeleton is only references into here.
@@ -151,6 +199,8 @@ export interface Entry {
   /** Appends one response event, as it arrives. */
   observeRawResponse(event: string): void;
   observeStatus(status: number): void;
+  /** Notes a tool-use block seen in the response. Ignores a repeat of one. */
+  observeToolUse(toolUse: ToolUse): void;
   /** Merges into what is already known; later events refine earlier ones. */
   observeUsage(usage: Usage): void;
   /** Ends the request, whether it was answered or not. Idempotent. */
@@ -178,6 +228,7 @@ export function createRecord(): Record {
   const requests: RecordedRequest[] = [];
   const diagnostics: Diagnostic[] = [];
   const blobs = createBlobs();
+  const threads = createThreads();
   /** Counted as events arrive, so a snapshot never re-measures the record. */
   let responseSize = 0;
 
@@ -190,9 +241,11 @@ export function createRecord(): Record {
       // point of watching one that is still in flight.
       const started = performance.now();
       const rawResponse: string[] = [];
+      const toolUses: ToolUse[] = [];
       let request: RecordedRequest = {
         seq,
         type,
+        thread: null,
         method,
         endpoint,
         model: null,
@@ -204,6 +257,7 @@ export function createRecord(): Record {
         skeleton: null,
         rawResponse,
         interrupted: false,
+        toolUses,
       };
       requests.push(request);
 
@@ -216,12 +270,27 @@ export function createRecord(): Record {
         seq,
         type,
         observeModel: (model) => amend({ model }),
-        observePayload: (payload) => amend({ skeleton: blobs.store(payload, type) }),
+        observePayload: (payload) => {
+          const stored = blobs.store(payload, type);
+          // Attributed from the payload that was held, so the prefix a thread
+          // is derived from is the prefix the record can show.
+          amend({
+            skeleton: stored.skeleton,
+            thread: threads.attribute(seq, stored.messageAddresses),
+          });
+        },
         observeRawResponse: (event) => {
           responseSize += Buffer.byteLength(event);
           rawResponse.push(event);
         },
         observeStatus: (status) => amend({ status }),
+        observeToolUse: (toolUse) => {
+          // A `data:` line inside an event still open is read again on the
+          // next pass, so the same block arrives more than once; the response
+          // opened it once either way.
+          if (toolUses.some((seen) => seen.id === toolUse.id)) return;
+          toolUses.push(toolUse);
+        },
         observeUsage: (usage) => amend({ usage: { ...request.usage, ...usage } }),
         complete: (ending) => {
           if (request.completedAt !== null) return;
@@ -242,7 +311,12 @@ export function createRecord(): Record {
     // stands: an array still being appended to is a later record than the one
     // its reader was handed.
     snapshot: () => ({
-      requests: requests.map((request) => ({ ...request, rawResponse: [...request.rawResponse] })),
+      requests: requests.map((request) => ({
+        ...request,
+        rawResponse: [...request.rawResponse],
+        toolUses: [...request.toolUses],
+      })),
+      threads: threads.list(),
       blobs: blobs.map(),
       storage: measure(blobs.storage(), responseSize),
       diagnostics: [...diagnostics],

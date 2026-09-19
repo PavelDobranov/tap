@@ -2,7 +2,8 @@ import { StringDecoder } from "node:string_decoder";
 import type { Transform } from "node:stream";
 import { createBrotliDecompress, createGunzip, createInflate } from "node:zlib";
 import type { Ending, Entry, Record } from "./record.ts";
-import { readModel, readResponseModel, readSse, readUsage } from "./wire.ts";
+import { invokesSubagent } from "../agent/claude.ts";
+import { readModel, readResponseModel, readSse, readToolUses, readUsage } from "./wire.ts";
 
 /**
  * What the proxy tells capture as one request crosses it. The proxy calls
@@ -333,6 +334,13 @@ function observe(entry: Entry, value: unknown): void {
   if (usage !== null) entry.observeUsage(usage);
   const model = readResponseModel(value);
   if (model !== null) entry.observeModel(model);
+  // Every tool-use block, each saying whether it is a subagent invocation.
+  // Recording them all and marking some is what keeps the one inference here —
+  // which tool name starts a subagent — from being able to cost the record a
+  // fact the response plainly stated.
+  for (const { id, name } of readToolUses(value)) {
+    entry.observeToolUse({ id, tool: name, subagentInvocation: invokesSubagent(name) });
+  }
 }
 
 /**
