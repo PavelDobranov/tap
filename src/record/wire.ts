@@ -63,32 +63,56 @@ export function readResponseModel(value: unknown): string | null {
   return typeof model === "string" ? model : null;
 }
 
+/** What one pass over a run of server-sent events found. */
+export interface SseFrames {
+  /** Whole events, verbatim and in order, each ending in its blank line. */
+  events: string[];
+  /** The content of every complete `data:` line, closed event or not. */
+  dataLines: string[];
+  /** Whatever is not a whole event yet, to be scanned again with what follows. */
+  rest: string;
+}
+
 /**
- * Frames a run of server-sent events: the `data:` payloads that are complete
- * in `buffered`, and whatever trailing bytes are not a whole line yet.
+ * Frames a run of server-sent events: the events that are complete in
+ * `buffered`, the `data:` lines they carry, and the trailing bytes that are
+ * not yet a whole event.
  *
- * Splitting on the line rather than on the blank-line event boundary is
- * deliberate: a `data:` line is complete the moment its newline arrives, so a
- * response in flight gives up its usage without waiting for the event it
- * belongs to to be closed.
+ * Events and data lines are framed differently on purpose. An event is
+ * complete only at its blank line, because the record holds it as the upstream
+ * wrote it; a `data:` line is complete the moment its own newline arrives, so
+ * a response in flight gives up its usage without waiting for the event it
+ * belongs to to be closed. A line inside an event that is still open is
+ * therefore reported again on the next pass — reading the same usage twice
+ * costs nothing, and delaying it would cost the live view its point.
  *
- * Framing only — nothing here parses. A payload Tap cannot read must not be
- * able to stop the buffer advancing past it, or a single bad line would make
- * every later chunk rescan a buffer that only ever grows.
+ * Framing only — nothing here parses. A line Tap cannot read must not be able
+ * to stop the buffer advancing past it, or a single bad one would make every
+ * later chunk rescan a buffer that only ever grows.
  */
-export function readSseData(buffered: string): { payloads: string[]; rest: string } {
+export function readSse(buffered: string): SseFrames {
   const lines = buffered.split("\n");
-  const rest = lines.pop() ?? "";
-  const payloads: string[] = [];
-  for (const line of lines) {
-    if (!line.startsWith("data:")) continue;
-    const payload = line.slice("data:".length).trim();
-    // A stream may signal its end with a sentinel rather than an object; that
-    // is not something Tap failed to read.
-    if (payload === "" || payload === "[DONE]") continue;
-    payloads.push(payload);
+  const trailing = lines.pop() ?? "";
+  const events: string[] = [];
+  const dataLines: string[] = [];
+
+  let opened = 0;
+  for (const [index, line] of lines.entries()) {
+    if (line.startsWith("data:")) {
+      const content = line.slice("data:".length).trim();
+      // A stream may signal its end with a sentinel rather than an object; that
+      // is not something Tap failed to read.
+      if (content !== "" && content !== "[DONE]") dataLines.push(content);
+    }
+    if (line.trim() !== "") continue;
+    // A blank line closes whatever was open. A run of them closes nothing:
+    // an event with no content is separator, not evidence.
+    const event = lines.slice(opened, index + 1);
+    opened = index + 1;
+    if (event.some((text) => text.trim() !== "")) events.push(`${event.join("\n")}\n`);
   }
-  return { payloads, rest };
+
+  return { events, dataLines, rest: [...lines.slice(opened), trailing].join("\n") };
 }
 
 function asObject(value: unknown): { [key: string]: unknown } | undefined {

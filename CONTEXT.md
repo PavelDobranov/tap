@@ -95,6 +95,19 @@ annotations that were stripped before hashing. Reconstruction from a skeleton
 and its blobs is exact.
 _Avoid_: envelope, stub, manifest, normalised payload
 
+**Payload**:
+The request body exactly as it crossed the proxy, held verbatim in the record
+and byte-identical to what the upstream received. Every request has one,
+`other` included: the request Tap cannot read is the one worth having in full.
+_Avoid_: body, request JSON, prompt
+
+**Interrupted**:
+The state of a request whose response ended without the upstream closing it —
+cut mid-stream, or never answered at all. What was captured up to that point
+stands and is marked as partial, because a truncated record read as a complete
+one is the failure that produces a confident wrong conclusion.
+_Avoid_: aborted, failed, incomplete, truncated
+
 **Raw response**:
 The response events exactly as they streamed from upstream. Kept while the
 response is in flight, and discarded once it has been reassembled — except when

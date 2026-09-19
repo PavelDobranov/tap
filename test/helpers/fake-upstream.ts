@@ -11,7 +11,16 @@ import { setTimeout as delay } from "node:timers/promises";
 export interface SseFixture {
   readonly status: number;
   readonly headers: Readonly<Record<string, string>>;
-  readonly chunks: readonly { readonly gapMs: number; readonly text: string }[];
+  readonly chunks: readonly {
+    readonly gapMs: number;
+    readonly text: string;
+    /**
+     * How `text` becomes bytes, `utf8` unless said otherwise. `latin1` is how
+     * a fixture splits one character across two chunks: the halves are not
+     * text in any encoding, and only the bytes matter.
+     */
+    readonly encoding?: BufferEncoding;
+  }[];
 }
 
 /** Reads a fixture from `test/fixtures/sse`, by name and without its extension. */
@@ -45,7 +54,15 @@ export interface RecordedRequest {
  * plain response, which covers both a non-streaming success and an error.
  */
 export type UpstreamPlan =
-  | { readonly stream: SseFixture }
+  | {
+      readonly stream: SseFixture;
+      /**
+       * Destroys the connection after the last chunk instead of closing the
+       * response: an upstream that went away mid-stream, which is the only
+       * honest way to test what Tap keeps of one.
+       */
+      readonly cut?: boolean;
+    }
   | {
       readonly status?: number;
       readonly headers?: Readonly<Record<string, string>>;
@@ -85,9 +102,19 @@ export async function startFakeUpstream(plan: UpstreamPlan): Promise<FakeUpstrea
         res.flushHeaders();
         for (const chunk of chunks) {
           if (chunk.gapMs > 0) await delay(chunk.gapMs);
-          res.write(chunk.text);
+          // Awaited so that a cut upstream has demonstrably put every chunk on
+          // the wire before it goes away: a chunk still in this server's own
+          // buffer would make the test about the fixture rather than Tap.
+          await new Promise<void>((flushed) =>
+            res.write(Buffer.from(chunk.text, chunk.encoding ?? "utf8"), () => flushed()),
+          );
         }
-        res.end();
+        if (plan.cut === true) {
+          await delay(20);
+          res.socket?.destroy();
+        } else {
+          res.end();
+        }
         return;
       }
 

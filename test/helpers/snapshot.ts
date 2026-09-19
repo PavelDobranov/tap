@@ -17,6 +17,12 @@ export interface SnapshotRequest {
   startedAt: string;
   completedAt: string | null;
   durationMs: number | null;
+  /** The request body exactly as it was forwarded, or null if none was kept. */
+  payload: string | null;
+  /** The response as it streamed: one entry per event, in arrival order. */
+  rawResponse: string[];
+  /** Whether the response ended without the upstream closing it cleanly. */
+  interrupted: boolean;
   usage: {
     inputTokens?: number;
     outputTokens?: number;

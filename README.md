@@ -39,6 +39,21 @@ started and finished, how long it took, and the token and cache usage the
 provider reported. Requests Tap does not recognise are recorded by method and
 path rather than discarded.
 
+The evidence itself is there too. Each request holds its **payload**: the body
+byte for byte as the upstream received it, `other` requests included, since the
+request Tap cannot read is the one worth having in full. For the requests it
+does recognise it holds the response as it streamed, event by event. Events are written down as they
+arrive rather than at the end, so a response still in flight is readable as far
+as it has got, and one that was cut off leaves what it got rather than nothing,
+marked `interrupted` so a partial answer is never read as a complete one.
+
+Holding all that verbatim is expensive: every request resends the whole
+conversation, so the record grows with the square of the conversation length.
+That is knowingly the case for now — `docs/measurements/raw-payload-capture.md`
+records what it costs — and is what content-addressed storage fixes next. One
+request will not take the session down with it in the meantime: past a 32MB
+hold, capture keeps what arrived and says in a diagnostic that it stopped.
+
 *Reaches the proxy* is the limit of what Tap can claim. Some of Claude Code's
 calls go to Anthropic whatever `ANTHROPIC_BASE_URL` says and never cross Tap
 at all; those are absent from the record, and no diagnostic marks them,

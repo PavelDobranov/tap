@@ -32,3 +32,13 @@ blobs are not compressed, because they are read continuously by a live UI
 rather than sitting cold; and the blob map is what eviction acts on, so a
 single huge tool result can be dropped while the shape of the request that
 carried it survives.
+
+**Interim state, #14.** Payload capture landed before the scheme did, so the
+record currently holds payloads exactly as this ADR says it must not: verbatim,
+and quadratic in conversation length. That is deliberate sequencing rather than
+a reversal — there has to be evidence in the record before there is anything to
+deduplicate — and it is bounded in time by #15, which is the ticket that builds
+the blob map. `docs/measurements/raw-payload-capture.md` records what the
+interim costs, so the scheme is held to a measured number rather than to the
+argument above. Until then the Blob and Skeleton entries in `CONTEXT.md`
+describe where the record is going, and the Payload entry describes where it is.

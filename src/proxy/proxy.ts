@@ -119,10 +119,10 @@ function forward(
     // backpressure it would have had without Tap.
     upstreamRes.pipe(res);
     upstreamRes.on("data", (chunk: Buffer) => captured.responseChunk(chunk));
-    upstreamRes.on("end", () => captured.end());
+    upstreamRes.on("end", () => captured.end("closed"));
     upstreamRes.on("error", () => {
       res.destroy();
-      captured.end();
+      captured.end("cut");
     });
 
     captured.responseStart(upstreamRes.statusCode ?? 502, upstreamRes.headers);
@@ -138,14 +138,16 @@ function forward(
     // No status is recorded: the upstream never gave one, and inventing Tap's
     // own 502 here would put a provider answer in the record that the provider
     // never sent.
-    captured.end();
+    captured.end("cut");
   });
 
   // An agent that gives up mid-request must not leave Tap holding the upstream
   // one open.
   res.on("close", () => {
     if (!res.writableEnded) outbound.destroy();
-    captured.end();
+    // A response the upstream already closed has ended by then; reaching here
+    // first means the agent hung up on one that had not.
+    captured.end("cut");
   });
 
   req.pipe(outbound);
@@ -181,7 +183,7 @@ function watch(capture: Capture, req: IncomingMessage): RequestCapture {
     responseStart: (status, headers) =>
       guarded(() => opened.responseStart(status, headers)),
     responseChunk: (chunk) => guarded(() => opened.responseChunk(chunk)),
-    end: () => guarded(() => opened.end()),
+    end: (ending) => guarded(() => opened.end(ending)),
   };
 }
 

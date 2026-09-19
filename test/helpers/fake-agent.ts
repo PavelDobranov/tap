@@ -110,6 +110,24 @@ const transcript = { baseUrl: base.toString(), responses: [] };
 
 function ask(step) {
   return new Promise((resolve) => {
+    // Collected out here so a response that is cut off still reports what it
+    // received before the connection went away.
+    const chunks = [];
+    let answered;
+    let first;
+    let done = false;
+    const finish = (error) => {
+      if (done) return;
+      done = true;
+      transcript.responses.push({
+        status: answered ? answered.statusCode : 0,
+        headers: answered ? answered.headers : {},
+        chunks,
+        body: chunks.map((chunk) => chunk.text).join(""),
+        ...(error === undefined ? {} : { error }),
+      });
+      resolve();
+    };
     const path = step.path || "/v1/messages";
     const body = step.body === undefined ? '{"model":"claude-opus-5"}' : step.body;
     const request = http.request(
@@ -125,29 +143,22 @@ function ask(step) {
       },
       (response) => {
         response.socket.setNoDelay(true);
-        const chunks = [];
-        let first;
+        answered = response;
         response.on("data", (chunk) => {
           const now = process.hrtime.bigint();
           if (first === undefined) first = now;
           chunks.push({ atMs: Number(now - first) / 1e6, text: chunk.toString("utf8") });
         });
-        response.on("end", () => {
-          transcript.responses.push({
-            status: response.statusCode,
-            headers: response.headers,
-            chunks,
-            body: chunks.map((chunk) => chunk.text).join(""),
-          });
-          resolve();
+        response.on("end", () => finish());
+        // A response the upstream cut off never ends; what arrived before the
+        // connection went away is still what the agent saw.
+        response.on("close", () => {
+          if (!response.complete) finish("the response was cut off");
         });
       },
     );
     request.on("socket", (socket) => socket.setNoDelay(true));
-    request.on("error", (error) => {
-      transcript.responses.push({ status: 0, headers: {}, chunks: [], body: "", error: String(error.message) });
-      resolve();
-    });
+    request.on("error", (error) => finish(String(error.message)));
     request.end(body);
   });
 }

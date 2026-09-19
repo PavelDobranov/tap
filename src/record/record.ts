@@ -34,6 +34,31 @@ export interface RecordedRequest {
   readonly completedAt: string | null;
   readonly durationMs: number | null;
   readonly usage: Usage | null;
+  /**
+   * The request body exactly as it crossed the proxy, or null when there was
+   * none to keep — nothing was sent, or capture could not hold it. Verbatim:
+   * the evidence is worth nothing if it is a re-serialisation of what Tap
+   * happened to parse.
+   */
+  readonly payload: string | null;
+  /**
+   * The response as it streamed from the upstream: one entry per event, in
+   * arrival order, appended as each arrives rather than held back until the
+   * response is finished — a response still in flight is readable as far as it
+   * has got, and one that was cut leaves what it got rather than nothing.
+   *
+   * Kept for the whole Tap session for now. Once there is a reassembler (#5)
+   * these are dropped as soon as the response has been reassembled, and stay
+   * only where reassembly failed or the stream was cut.
+   */
+  readonly rawResponse: readonly string[];
+  /**
+   * Whether the response ended without the upstream closing it: the stream was
+   * cut, or there was never an answer at all. What was captured up to that
+   * point stands, and says so — a partial record read as a complete one is the
+   * failure that produces a confident wrong conclusion.
+   */
+  readonly interrupted: boolean;
 }
 
 /**
@@ -55,6 +80,12 @@ export interface Snapshot {
 }
 
 /**
+ * How a request ended: the upstream closed its response, or it was cut — by
+ * the upstream, by the agent giving up, or by never being answered at all.
+ */
+export type Ending = "closed" | "cut";
+
+/**
  * One request's place in the record, handed out when the request starts and
  * filled in as more is learned about it.
  *
@@ -66,11 +97,15 @@ export interface Entry {
   readonly seq: number;
   readonly type: RequestType;
   observeModel(model: string): void;
+  /** Holds the request body as it was forwarded. */
+  observePayload(payload: string): void;
+  /** Appends one response event, as it arrives. */
+  observeRawResponse(event: string): void;
   observeStatus(status: number): void;
   /** Merges into what is already known; later events refine earlier ones. */
   observeUsage(usage: Usage): void;
   /** Ends the request, whether it was answered or not. Idempotent. */
-  complete(): void;
+  complete(ending: Ending): void;
 }
 
 /**
@@ -102,6 +137,7 @@ export function createRecord(): Record {
       // is visible when it starts, not when it finishes, which is the whole
       // point of watching one that is still in flight.
       const started = performance.now();
+      const rawResponse: string[] = [];
       let request: RecordedRequest = {
         seq,
         type,
@@ -113,6 +149,9 @@ export function createRecord(): Record {
         completedAt: null,
         durationMs: null,
         usage: null,
+        payload: null,
+        rawResponse,
+        interrupted: false,
       };
       requests.push(request);
 
@@ -125,13 +164,16 @@ export function createRecord(): Record {
         seq,
         type,
         observeModel: (model) => amend({ model }),
+        observePayload: (payload) => amend({ payload }),
+        observeRawResponse: (event) => rawResponse.push(event),
         observeStatus: (status) => amend({ status }),
         observeUsage: (usage) => amend({ usage: { ...request.usage, ...usage } }),
-        complete: () => {
+        complete: (ending) => {
           if (request.completedAt !== null) return;
           amend({
             completedAt: new Date().toISOString(),
             durationMs: Math.round(performance.now() - started),
+            interrupted: ending === "cut",
           });
         },
       };
@@ -141,7 +183,13 @@ export function createRecord(): Record {
       diagnostics.push({ at: new Date().toISOString(), seq, detail: describe(detail) });
     },
 
-    snapshot: () => ({ requests: [...requests], diagnostics: [...diagnostics] }),
+    // Copied down to the raw events, because a snapshot is the record as it
+    // stands: an array still being appended to is a later record than the one
+    // its reader was handed.
+    snapshot: () => ({
+      requests: requests.map((request) => ({ ...request, rawResponse: [...request.rawResponse] })),
+      diagnostics: [...diagnostics],
+    }),
   };
 }
 
