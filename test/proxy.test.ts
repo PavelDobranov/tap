@@ -328,3 +328,22 @@ test("the proxy stops accepting requests once the agent has exited", async () =>
   await quit(session);
   assert.equal(await reachable("127.0.0.1", proxyPort), false);
 });
+
+test("a refused configuration reaches neither the upstream nor the agent", async () => {
+  const api = await upstream(response("{}"));
+  const file = path.join(scratch, `probe-${probeFiles++}.json`);
+  const session = startTap(["launch", "claude"], {
+    env: {
+      PATH: agent.pathEnv,
+      ANTHROPIC_BASE_URL: api.baseUrl,
+      FAKE_AGENT_PROBE_FILE: file,
+      CLAUDE_CODE_USE_VERTEX: "1",
+    },
+  });
+
+  const result = await session.exited;
+
+  assert.notEqual(result.code, 0);
+  assert.equal(existsSync(file), false, "the agent must not have run");
+  assert.deepEqual([...api.requests], [], "nothing may be forwarded");
+});

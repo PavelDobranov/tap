@@ -46,6 +46,13 @@ Where Tap forwards requests: the base URL inherited from the environment if one
 is set, otherwise the default Anthropic API.
 _Avoid_: provider, backend, origin, target
 
+**Unsupported configuration**:
+An environment that points the agent at a cloud provider rather than the
+Anthropic API — any `CLAUDE_CODE_USE_*` variable. The upstream has no base URL
+to override there, so Tap refuses the launch instead of serving an empty
+record.
+_Avoid_: unsupported provider, cloud mode, non-Anthropic backend
+
 **Request**:
 Anything that reaches the proxy, whether or not Tap understands it. Every
 request is typed `messages`, `count_tokens` or `other`, and all three are

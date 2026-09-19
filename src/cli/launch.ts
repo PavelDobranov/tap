@@ -1,4 +1,9 @@
-import { CLAUDE, readInvocation, UnknownAgentError } from "../agent/claude.ts";
+import {
+  CLAUDE,
+  findUnsupportedConfiguration,
+  readInvocation,
+  UnknownAgentError,
+} from "../agent/claude.ts";
 import { AgentNotFoundError, describeOutcome, runAgent } from "../agent/run.ts";
 import { startProxy } from "../proxy/proxy.ts";
 import { resolveUpstream } from "../proxy/upstream.ts";
@@ -19,6 +24,10 @@ import { EXIT_FAILURE, EXIT_OK, EXIT_USAGE, type Io } from "./io.ts";
  * SIGINT is held from before the agent is spawned until the frozen session
  * takes it over, so there is no instant at which a Ctrl+C meant for the agent
  * can end Tap first.
+ *
+ * A configuration Tap cannot see through is refused before any of that: no
+ * port is bound and no agent is spawned, so the developer is left exactly
+ * where they were rather than in a session that would show nothing.
  */
 export async function launch(argv: readonly string[], io: Io): Promise<number> {
   let invocation;
@@ -28,6 +37,16 @@ export async function launch(argv: readonly string[], io: Io): Promise<number> {
     if (!(error instanceof UnknownAgentError)) throw error;
     io.stderr.write(
       `tap: ${error.message}\n` + `The only agent tap can launch is ${CLAUDE}.\n`,
+    );
+    return EXIT_USAGE;
+  }
+
+  const unsupported = findUnsupportedConfiguration(process.env);
+  if (unsupported !== undefined) {
+    io.stderr.write(
+      `tap: ${unsupported} is set, which points ${CLAUDE} at a cloud provider\n` +
+        `tap v0 supports only direct Anthropic API traffic.\n` +
+        `Unset it to run ${CLAUDE} through tap.\n`,
     );
     return EXIT_USAGE;
   }

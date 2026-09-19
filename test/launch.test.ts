@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { after, test } from "node:test";
@@ -148,4 +148,52 @@ test("concurrent sessions do not interfere with one another", async () => {
   assert.match(survivor.stderr, /exited with code 0/);
   assert.deepEqual(first.read(), ["--first"]);
   assert.deepEqual(second.read(), ["--second"]);
+});
+
+for (const variable of [
+  "CLAUDE_CODE_USE_BEDROCK",
+  "CLAUDE_CODE_USE_VERTEX",
+  "CLAUDE_CODE_USE_FOUNDRY",
+  "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+  "CLAUDE_CODE_USE_SOMETHING_TAP_HAS_NEVER_HEARD_OF",
+]) {
+  test(`${variable} is refused by name instead of showing nothing`, async () => {
+    const argv = argvFile();
+    const result = await runTap(["launch", "claude"], {
+      env: env({ FAKE_AGENT_ARGV_FILE: argv.path, [variable]: "1" }),
+    });
+
+    assert.notEqual(result.code, 0);
+    assert.match(result.stderr, new RegExp(variable), "the message must name the variable");
+    assert.match(result.stderr, /only direct Anthropic API traffic/i);
+    assert.match(result.stderr, /\bv0\b/);
+    assert.doesNotMatch(result.stderr, /^\s+at /m, "should not print a stack trace");
+    assert.equal(result.stdout, "");
+    assert.equal(existsSync(argv.path), false, "no agent may be spawned");
+  });
+}
+
+test("a value of 0 still selects, because that is how Claude Code reads it", async () => {
+  const result = await runTap(["launch", "claude"], {
+    env: env({ CLAUDE_CODE_USE_BEDROCK: "0" }),
+  });
+
+  assert.notEqual(result.code, 0);
+  assert.match(result.stderr, /CLAUDE_CODE_USE_BEDROCK/);
+});
+
+test("a variable that is set but empty selects nothing and launches", async () => {
+  const argv = argvFile();
+  const session = startTap(["launch", "claude"], {
+    env: env({
+      FAKE_AGENT_ARGV_FILE: argv.path,
+      FAKE_AGENT_EXIT: "0",
+      CLAUDE_CODE_USE_BEDROCK: "",
+    }),
+  });
+
+  const result = await quitFrozenSession(session);
+
+  assert.doesNotMatch(result.stderr, /CLAUDE_CODE_USE_BEDROCK/);
+  assert.deepEqual(argv.read(), []);
 });

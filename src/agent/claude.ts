@@ -39,3 +39,31 @@ export function readInvocation(argv: readonly string[]): Invocation {
   if (name !== CLAUDE) throw new UnknownAgentError(name!);
   return { command: CLAUDE, args };
 }
+
+/**
+ * The prefix of every Claude Code variable that selects a cloud provider —
+ * `CLAUDE_CODE_USE_BEDROCK`, `_VERTEX`, `_FOUNDRY`, `_ANTHROPIC_AWS`.
+ *
+ * Matched by prefix rather than by name so that a variable Tap has never heard
+ * of refuses too. Getting that wrong in the other direction is the expensive
+ * mistake: `ANTHROPIC_BASE_URL` has no effect on any of these configurations,
+ * so a session Tap agreed to launch would show nothing at all, and an
+ * inspector that quietly shows nothing is worse than one that refuses.
+ */
+const UNSUPPORTED_PREFIX = "CLAUDE_CODE_USE_";
+
+/**
+ * The variable making this environment an unsupported configuration, if one
+ * does. Read before anything is bound or spawned: refusing is only better than
+ * showing nothing if it costs the developer nothing.
+ *
+ * A variable present but empty selects nothing, which is the reading Claude
+ * Code gives it; every other value, `0` included, selects. Variables are
+ * considered in name order, so an environment with several of them always
+ * names the same one.
+ */
+export function findUnsupportedConfiguration(env: NodeJS.ProcessEnv): string | undefined {
+  return Object.keys(env)
+    .sort()
+    .find((variable) => variable.startsWith(UNSUPPORTED_PREFIX) && env[variable] !== "");
+}

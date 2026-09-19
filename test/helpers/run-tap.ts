@@ -14,6 +14,24 @@ export const repoRoot = new URL("../../", import.meta.url);
 const SIGNAL_NUMBERS: Record<string, number> = { SIGINT: 2, SIGKILL: 9, SIGTERM: 15 };
 
 /**
+ * The environment a `tap` under test is started in: this process's, minus the
+ * variables Tap reads, plus whatever the test asked for.
+ *
+ * Those are dropped because whoever runs the suite may be behind a gateway or
+ * configured for a cloud provider, and inheriting either would point Tap
+ * somewhere the test did not choose or refuse the launch outright. A test that
+ * wants one says so.
+ */
+function childEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+  const inherited = Object.fromEntries(
+    Object.entries(process.env).filter(
+      ([name]) => name !== "ANTHROPIC_BASE_URL" && !name.startsWith("CLAUDE_CODE_USE_"),
+    ),
+  );
+  return { ...inherited, ...extra };
+}
+
+/**
  * Runs a command and resolves with its outcome. Never rejects: a nonzero exit
  * is something to assert on, not an error. A signal death is reported as a
  * nonzero code so a crashed process can never be mistaken for success.
@@ -29,7 +47,7 @@ export function run(
       args,
       {
         cwd: options.cwd ?? fileURLToPath(repoRoot),
-        env: { ...process.env, ...options.env },
+        env: childEnv(options.env),
         encoding: "utf8",
       },
       (error, stdout, stderr) => {
@@ -110,7 +128,7 @@ export function startTap(
     [fileURLToPath(new URL("dist/cli.js", repoRoot)), ...args],
     {
       cwd: options.cwd ?? fileURLToPath(repoRoot),
-      env: { ...process.env, ...options.env },
+      env: childEnv(options.env),
       detached: true,
       stdio: ["pipe", "pipe", "pipe"],
     },
