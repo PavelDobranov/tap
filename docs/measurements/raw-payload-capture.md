@@ -84,22 +84,46 @@ The scheme is worth exactly nothing without it, and nothing about the shape of
 a skeleton reveals it, which is why the measurement is part of the ticket
 rather than a footnote to it.
 
-## Redoing this against real traffic
+## Real Claude Code traffic (#18)
 
-The scripted conversation is a stand-in for the shape, not for the traffic. To
-take the same number from a real Claude Code conversation, start a Tap session,
-work in it normally, and read the high-water mark off the live `tap` process
-before interrupting it:
+The scripted conversation is a stand-in for the shape, not for the traffic, so
+#18 repeated the measurement against one real Tap-wrapped Claude Code session.
+The session used Claude Code in non-interactive stream-json mode with the real
+`Read`, `Glob`, `Grep`, and `Bash` tools available. It had 6 user turns, and
+Claude Code expanded those into 15 model/tool continuation turns: it read the
+project README, `package.json`, this measurement note, the baseline script,
+relevant capture/storage tests, `src/record/capture.ts`, `src/record/blobs.ts`,
+and ran a harmless test-counting shell command. The final request carried about
+40k input tokens of live context according to Claude Code's usage report.
+
+The peak was read from the frozen live Tap process before interrupting it:
 
 ```
-tap launch claude          # in one terminal
-pgrep -f 'dist/cli.js launch'
-node scripts/measure-capture-baseline.mjs --pid <pid>
+node dist/cli.js launch --port 8370 claude -p --input-format stream-json \
+  --output-format stream-json --verbose --model sonnet \
+  --permission-mode bypassPermissions --permission-prompts none \
+  --tools 'Read,Grep,Glob,Bash'
+node scripts/measure-capture-baseline.mjs --pid 1061356
+# tap 1061356: peak resident set 80.9 MiB
 ```
 
-That is #18, and it is still open. Deduplication is precisely the thing that
-behaves differently on real traffic than on `"x".repeat(...)` filler — repeated
-tool schemas and a stable system block are what it exploits, and moving cache
-breakpoints are what it has to survive — so the 120x above is the shape of the
-script as much as of the scheme. The two tables are comparable to each other;
-neither is yet a claim about a real conversation.
+The snapshot behind that process reported 9 captured requests, of which 8 were
+`/v1/messages` requests. Reconstructing each skeleton gives the request payload
+forwarded below.
+
+| Session | Requests | Request payload forwarded | Peak RSS | Cost of capture | Payload held | Blobs | Deduplication |
+| ------- | -------- | ------------------------- | -------- | --------------- | ------------ | ----- | ------------- |
+| real Claude Code, 6 user turns / 15 tool turns | 8 messages + 1 other | 0.52 MiB | 80.9 MiB | 15.2 MiB | 0.12 MiB | 31 | 3.0x |
+
+The cost column uses the same-script idle Tap floor on this machine, 65.7 MiB,
+so at this small size it is dominated by fixed process overhead rather than by
+payload retention. That is the main divergence from the 20/40/80-turn scripted
+curve: the real dogfood session was much shorter, but carried real tool result
+variety. The storage ratio is therefore nowhere near the scripted 120x at 80
+turns; most of what this session added was distinct file and command output,
+not repeated filler. Even so, the record held 0.52 MiB of exact forwarded
+payload in 0.12 MiB, and the structural conclusion of #15 does not change:
+content-addressed storage still removes the resend-the-whole-conversation
+quadratic record growth. The real number changes the expected magnitude for a
+short tool-heavy session, not the decision that the record should be stored by
+reused units rather than verbatim request bodies.
