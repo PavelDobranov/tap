@@ -1,3 +1,21 @@
+import { createBlobs, type BlobMap, type PayloadStorage, type Skeleton } from "./blobs.ts";
+
+/**
+ * Re-exported so that the snapshot is one interface rather than two: a
+ * reader that has the shape of a `Snapshot` has everything needed to
+ * reconstruct a payload from it.
+ */
+export {
+  reconstruct,
+  type Annotation,
+  type Blob,
+  type BlobMap,
+  type PayloadStorage,
+  type Skeleton,
+  type SkeletonPart,
+  type UnitReference,
+} from "./blobs.ts";
+
 /**
  * What a request was recognised as. Every request that reaches the proxy gets
  * one of these — `other` is a type, not a bin: nothing arriving is discarded,
@@ -35,12 +53,18 @@ export interface RecordedRequest {
   readonly durationMs: number | null;
   readonly usage: Usage | null;
   /**
-   * The request body exactly as it crossed the proxy, or null when there was
-   * none to keep — nothing was sent, or capture could not hold it. Verbatim:
-   * the evidence is worth nothing if it is a re-serialisation of what Tap
-   * happened to parse.
+   * The request body as it crossed the proxy, held as a skeleton: the text
+   * that arrived, with its units replaced by references into the snapshot's
+   * blob map. Null when there was none to keep — nothing was sent, or capture
+   * could not hold it.
+   *
+   * Reconstruction is exact. Joining the parts, filling each reference from
+   * the blob map and putting its annotations back, gives the bytes the
+   * upstream received: the evidence is worth nothing if it is a
+   * re-serialisation of what Tap happened to parse. What is deduplicated is
+   * the representation, never the fidelity.
    */
-  readonly payload: string | null;
+  readonly skeleton: Skeleton | null;
   /**
    * The response as it streamed from the upstream: one entry per event, in
    * arrival order, appended as each arrives rather than held back until the
@@ -73,9 +97,30 @@ export interface Diagnostic {
   readonly detail: string;
 }
 
+/**
+ * What the record is costing, and what deduplication is saving it.
+ *
+ * `recordSize` is the whole of it, payloads and responses both, because a
+ * figure called the record's size that left out half the record is the kind
+ * of number a reader acts on and should not have.
+ */
+export interface Storage extends PayloadStorage {
+  readonly recordSize: number;
+  /** Bytes of response events held. Not deduplicated: every one is distinct. */
+  readonly responseSize: number;
+}
+
 /** The whole record as it stands. */
 export interface Snapshot {
   readonly requests: readonly RecordedRequest[];
+  /**
+   * Every unit the record holds, once each, by content hash. This is where
+   * the payloads actually are: a skeleton is only references into here.
+   */
+  readonly blobs: BlobMap;
+  /** What holding them costs, and how much resending them is saving. */
+  readonly storage: Storage;
+
   readonly diagnostics: readonly Diagnostic[];
 }
 
@@ -97,7 +142,11 @@ export interface Entry {
   readonly seq: number;
   readonly type: RequestType;
   observeModel(model: string): void;
-  /** Holds the request body as it was forwarded. */
+  /**
+   * Holds the request body as it was forwarded. The record takes it apart
+   * into blobs and a skeleton; the caller hands over the bytes and is not
+   * asked to know that.
+   */
   observePayload(payload: string): void;
   /** Appends one response event, as it arrives. */
   observeRawResponse(event: string): void;
@@ -128,6 +177,9 @@ export interface Record {
 export function createRecord(): Record {
   const requests: RecordedRequest[] = [];
   const diagnostics: Diagnostic[] = [];
+  const blobs = createBlobs();
+  /** Counted as events arrive, so a snapshot never re-measures the record. */
+  let responseSize = 0;
 
   return {
     begin(method, endpoint) {
@@ -149,7 +201,7 @@ export function createRecord(): Record {
         completedAt: null,
         durationMs: null,
         usage: null,
-        payload: null,
+        skeleton: null,
         rawResponse,
         interrupted: false,
       };
@@ -164,8 +216,11 @@ export function createRecord(): Record {
         seq,
         type,
         observeModel: (model) => amend({ model }),
-        observePayload: (payload) => amend({ payload }),
-        observeRawResponse: (event) => rawResponse.push(event),
+        observePayload: (payload) => amend({ skeleton: blobs.store(payload, type) }),
+        observeRawResponse: (event) => {
+          responseSize += Buffer.byteLength(event);
+          rawResponse.push(event);
+        },
         observeStatus: (status) => amend({ status }),
         observeUsage: (usage) => amend({ usage: { ...request.usage, ...usage } }),
         complete: (ending) => {
@@ -188,9 +243,16 @@ export function createRecord(): Record {
     // its reader was handed.
     snapshot: () => ({
       requests: requests.map((request) => ({ ...request, rawResponse: [...request.rawResponse] })),
+      blobs: blobs.map(),
+      storage: measure(blobs.storage(), responseSize),
       diagnostics: [...diagnostics],
     }),
   };
+}
+
+/** The payload figures with the responses beside them, as the snapshot shows. */
+function measure(payload: PayloadStorage, responseSize: number): Storage {
+  return { ...payload, responseSize, recordSize: payload.payloadSize + responseSize };
 }
 
 /** The Anthropic endpoints Tap understands. Everything else is `other`. */

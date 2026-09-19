@@ -1,9 +1,12 @@
 #!/usr/bin/env node
-// Measures what verbatim capture costs in memory, so #15 has something to
-// prove itself against. Every `/v1/messages` request resends the whole
-// conversation, so holding payloads verbatim is quadratic in conversation
-// length; this replays a multi-turn conversation of a realistic shape and
-// reports the peak resident set of the `tap` process that captured it.
+// Measures what capture costs in memory. Every `/v1/messages` request resends
+// the whole conversation, so holding payloads verbatim is quadratic in
+// conversation length; this replays a multi-turn conversation of a realistic
+// shape and reports the peak resident set of the `tap` process that captured
+// it, together with what content-addressed storage held it in.
+//
+// It was written as the #14 baseline and is now the comparison for #15: same
+// script, same shape, so the two curves are the same measurement.
 //
 //   node scripts/measure-capture-baseline.mjs [--turns 40]
 //   node scripts/measure-capture-baseline.mjs --pid <pid>   # a live `tap`
@@ -17,6 +20,7 @@ import { createServer } from "node:net";
 import { fileURLToPath } from "node:url";
 import { createFakeAgent } from "../test/helpers/fake-agent.ts";
 import { startFakeUpstream } from "../test/helpers/fake-upstream.ts";
+import { printedUrl, snapshotAt } from "../test/helpers/snapshot.ts";
 
 const repoRoot = new URL("../", import.meta.url);
 
@@ -179,13 +183,16 @@ async function measure(turns) {
 
   const peak = peakRss(child.pid);
   const sent = turns === 0 ? { sent: 0, requests: 0 } : JSON.parse(readFileSync(report, "utf8"));
+  // Read before the session is interrupted: the record is the process, and
+  // interrupting it is what throws the record away.
+  const { storage } = await snapshotAt(printedUrl(stderr));
 
   child.kill("SIGINT");
   await new Promise((resolve) => child.on("exit", resolve));
   await upstream.close();
   agent.remove();
 
-  return { turns, peak, ...sent };
+  return { turns, peak, storage, ...sent };
 }
 
 const options = process.argv.slice(2);
@@ -210,3 +217,11 @@ console.log(
 );
 console.log(`cost of capturing them:      ${mib(loaded.peak - idle.peak)}`);
 console.log(`per megabyte forwarded:      ${((loaded.peak - idle.peak) / loaded.sent).toFixed(2)}x`);
+console.log(
+  `payload held:                ${mib(loaded.storage.payloadSize)}` +
+    ` in ${loaded.storage.blobCount} blobs`,
+);
+console.log(
+  `units referenced:            ${loaded.storage.referencedUnits}` +
+    ` (${loaded.storage.deduplicationRatio}x deduplication)`,
+);

@@ -33,17 +33,58 @@ rather than sitting cold; and the blob map is what eviction acts on, so a
 single huge tool result can be dropped while the shape of the request that
 carried it survives.
 
-**Interim state, #14.** Payload capture landed before the scheme did, so the
-record currently holds payloads exactly as this ADR says it must not: verbatim,
-and quadratic in conversation length. That is deliberate sequencing rather than
-a reversal — there has to be evidence in the record before there is anything to
-deduplicate — and it is bounded in time by #15, which is the ticket that builds
-the blob map. `docs/measurements/raw-payload-capture.md` records what the
-interim costs, so the scheme is held to a measured number rather than to the
-argument above. Until then the Blob and Skeleton entries in `CONTEXT.md`
-describe where the record is going, and the Payload entry describes where it is.
+**Interim state, #14 — now closed by #15.** Payload capture landed before the
+scheme did, so the record briefly held payloads exactly as this ADR says it
+must not: verbatim, and quadratic in conversation length. That was deliberate
+sequencing — there has to be evidence in the record before there is anything to
+deduplicate — and `docs/measurements/raw-payload-capture.md` holds both
+numbers: what verbatim capture cost, and what the scheme costs on the same
+script.
 
-It follows that the record is also, for now, uncapped and evicts nothing, which
-ADR-0005 says it must do. Eviction acts on blobs, so it cannot exist before the
-blob map does: the 32MB budget in capture bounds any single body or response
-and never the record as a whole. #15 restores both together.
+**Settled by #15.** The two details this ADR said were hard to change later are
+now decided.
+
+*Key ordering* is **ascending by UTF-16 code unit** — JavaScript's own default
+string sort, so `"A"` before `"a"` — with arrays left in their own order and no
+whitespace anywhere. Chosen because it is the ordering a reader of the code
+will assume and the one that needs no comparator to be written down correctly.
+
+*Annotations* are cut textually rather than structurally. `cache_control` is
+removed with the comma on whichever side has one, and the skeleton records the
+offset it was cut at along with the text; putting it back is a splice.
+
+One consequence was not anticipated and is worth writing down, because it is
+invisible from the shape of the data. **A blob must not be a substring of its
+payload.** In V8 a substring is a slice holding a reference to the string it
+was cut from, so a blob taken straight out of a request pins that entire
+request — the record deduplicates perfectly, reports a 120x ratio, and frees
+nothing. Every string the record keeps is detached from the payload it was read
+out of. The first run of the #15 measurement showed no improvement at all for
+exactly this reason, which is the argument for measuring the scheme rather than
+reasoning about it.
+
+A blob therefore holds **the bytes that arrived**, with annotations cut out —
+not the canonical JSON, which #15 asked for in as many words. Only one of the
+two can be true: canonical bytes cannot be handed back to a reader who was
+promised the payload byte for byte, and byte-exactness is the criterion that
+matters. Canonical JSON keeps the job it was introduced for, which is deciding
+what address a unit has, and the ticket's wording is corrected here rather than
+followed.
+
+Reconstruction being *textual* is what makes exactness cheap. A skeleton is the
+bytes that arrived with holes in it, so filling the holes cannot introduce a
+re-serialisation: no reordered key, no lost whitespace, no `1.0` that comes back
+as `1`. Canonical JSON is used only to decide what two units' shared address is,
+never to produce bytes a reader sees. So canonicalisation can only ever cost
+deduplication, and a unit whose bytes would not match the blob already at its
+address is simply left in the skeleton verbatim. That costs a duplicate, and it
+shows: an unaddressed unit is never counted as a reference, so the reported
+deduplication ratio falls rather than overstating a saving that is not there.
+
+**Eviction is still absent.** ADR-0005 says the record is capped and evicts
+oldest-first at blob level, and #15 built the blob map that eviction acts on
+but not eviction itself — the epic notes it as scope with no ticket yet. The
+32MB budget in capture still bounds any single body or response and never the
+record as a whole. What has changed is that the uncapped thing is now 1.4 MiB
+of payload for an 80-turn conversation rather than 119 MiB, so the gap is far
+less urgent than it was; it is still a gap.

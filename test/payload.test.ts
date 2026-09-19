@@ -4,13 +4,13 @@ import { after, test } from "node:test";
 import { fixtureBody, readSseFixture, type SseFixture } from "./helpers/fake-upstream.ts";
 import { killAllSessions } from "./helpers/run-tap.ts";
 import { createProber, quit, responds } from "./helpers/session.ts";
-import { snapshotAt } from "./helpers/snapshot.ts";
+import { payloadOf, snapshotAt } from "./helpers/snapshot.ts";
 
 const tap = createProber("payload");
 after(() => tap.dispose());
 after(killAllSessions);
 
-test("every request's payload is held verbatim, byte for byte with what the upstream got", async () => {
+test("every request's payload comes back byte for byte as the upstream got it", async () => {
   const api = await tap.upstream(responds("{}"));
   // Whitespace, key order and a non-ASCII character are all things a capture
   // that re-serialised what it parsed would quietly change.
@@ -29,15 +29,22 @@ test("every request's payload is held verbatim, byte for byte with what the upst
     api.baseUrl,
   );
 
-  const { requests } = await snapshot();
+  const captured = await snapshot();
+  const payloads = captured.requests.map((request) => payloadOf(captured, request));
+  assert.deepEqual(payloads, [messages, countTokens, other]);
   assert.deepEqual(
-    requests.map((request) => request.payload),
-    [messages, countTokens, other],
+    payloads,
+    api.requests.map((request) => request.body),
+    "the payload reconstructed from the record is the payload the upstream received",
+  );
+  assert.ok(
+    captured.requests[0]!.skeleton!.some((part) => typeof part !== "string"),
+    "and a body tap understands is held as references rather than as itself",
   );
   assert.deepEqual(
-    requests.map((request) => request.payload),
-    api.requests.map((request) => request.body),
-    "the payload in the record is the payload the upstream received",
+    captured.requests[2]!.skeleton,
+    [other],
+    "while one it does not is kept whole, not guessed at",
   );
 
   await quit(session);
@@ -180,8 +187,9 @@ test("a body capture cannot parse is still a body capture kept", async () => {
   const torn = '{"model":"claude-opus-5",';
   const { transcript, session, snapshot } = await tap.probe([{ body: torn }], api.baseUrl);
 
-  const { requests, diagnostics } = await snapshot();
-  assert.equal(requests[0]!.payload, torn, "unreadable is not the same as unrecorded");
+  const captured = await snapshot();
+  const { requests, diagnostics } = captured;
+  assert.equal(payloadOf(captured, requests[0]!), torn, "unreadable is not the same as unrecorded");
   assert.equal(requests[0]!.model, null, "and nothing is invented from what could not be read");
   assert.equal(diagnostics.length, 1, "the parse failure is still visible");
 
@@ -270,6 +278,67 @@ test("a character split across two chunks survives capture whole", async () => {
 
   const captured = (await snapshot()).requests[0]!;
   assert.deepEqual(captured.rawResponse, [text]);
+
+  await quit(session);
+});
+
+test("a multi-turn conversation is held once, not once per request", async () => {
+  // What a real session does: a large fixed preamble resent every time, a
+  // history that only grows, and a cache breakpoint that moves to the end of
+  // it each turn. The breakpoint is the part that would silently defeat
+  // deduplication, so it is in the fixture rather than only in a unit test.
+  const TURNS = 12;
+  const system = [{ type: "text", text: `you are a tap. ${"s".repeat(300)}` }];
+  const tools = Array.from({ length: 5 }, (_, index) => ({
+    name: `tool_${index}`,
+    description: "t".repeat(200),
+    input_schema: { type: "object" },
+  }));
+
+  const history: { role: string; content: unknown; cache_control?: unknown }[] = [];
+  const script = Array.from({ length: TURNS }, (_, turn) => {
+    history.push({ role: "user", content: `ask ${turn}: ${"u".repeat(120)}` });
+    // Yesterday's breakpoint goes, today's arrives. Same messages, spelled
+    // differently every request.
+    for (const message of history) delete message.cache_control;
+    history[history.length - 1]!.cache_control = { type: "ephemeral" };
+    const body = JSON.stringify({ model: "claude-opus-5", system, tools, messages: history });
+    history.push({ role: "assistant", content: `answer ${turn}: ${"a".repeat(200)}` });
+    return { path: "/v1/messages", body };
+  });
+
+  const api = await tap.upstream(responds("{}"));
+  const { session, snapshot } = await tap.probe(script, api.baseUrl);
+
+  const captured = await snapshot();
+  assert.deepEqual(
+    captured.requests.map((request) => payloadOf(captured, request)),
+    script.map((step) => step.body),
+    "every request still reconstructs to the bytes that were sent, breakpoints and all",
+  );
+
+  const { storage } = captured;
+  // Twelve requests resend a history growing to twenty-three messages: 144
+  // message units plus twelve each of system and tools.
+  assert.equal(storage.referencedUnits, 168);
+  assert.equal(
+    storage.blobCount,
+    25,
+    "twenty-three distinct messages, one system block and one tools array — " +
+      "a moved breakpoint is not a new message",
+  );
+  assert.equal(storage.deduplicationRatio, 6.72);
+
+  const sent = script.reduce((total, step) => total + Buffer.byteLength(step.body), 0);
+  assert.ok(
+    storage.payloadSize < sent / 5,
+    `held ${storage.payloadSize} bytes of the ${sent} forwarded`,
+  );
+  assert.equal(
+    storage.recordSize,
+    storage.payloadSize + storage.responseSize,
+    "and the record's size is the whole record, responses included",
+  );
 
   await quit(session);
 });

@@ -47,15 +47,46 @@ arrive rather than at the end, so a response still in flight is readable as far
 as it has got, and one that was cut off leaves what it got rather than nothing,
 marked `interrupted` so a partial answer is never read as a complete one.
 
-Holding all that verbatim is expensive: every request resends the whole
-conversation, so the record grows with the square of the conversation length.
-That is knowingly the case for now — `docs/measurements/raw-payload-capture.md`
-records what it costs — and is what content-addressed storage fixes next. One
-request will not take the session down with it in the meantime: nothing Tap
-holds grows past 32MB. A response that reaches the limit keeps what arrived
-before it; a request body that would exceed it is dropped whole, because half
-a payload presented as a payload is worse than a recorded absence. Either way
-a diagnostic says what happened.
+### How payloads are held
+
+Every `/v1/messages` request resends the whole conversation, so holding each
+body verbatim costs the square of the conversation length — several gigabytes
+of RAM in a long session. So the record does not hold them verbatim; it holds
+them *exactly*, which is not the same thing.
+
+Each payload is split into **units** — the `system` block, the `tools` array,
+and each element of `messages[]` — and each unit is stored once, in a **blob**
+addressed by the SHA-256 of its canonical JSON. What is left against the
+request is a **skeleton**: the bytes that arrived, with each unit replaced by a
+reference to its blob. The fiftieth request in a conversation therefore adds one
+message to the record rather than fifty.
+
+`cache_control` is cut out before a unit is addressed and recorded in the
+skeleton instead. Claude Code moves its cache breakpoints from one request to
+the next, and without this an unchanged message would get a new address every
+time a breakpoint landed on or left it, which would quietly halve the saving.
+
+**Reconstruction is exact.** A reader joins the skeleton's parts, replacing
+each reference with its blob's `json` and splicing that reference's
+annotations back in at the offsets given, and gets the bytes the upstream
+received — whitespace, key order, escapes and all. Nothing is re-serialised: a
+skeleton is the original text with holes in it. A body Tap cannot take apart —
+an `other` request, or one that is not JSON — has a skeleton of a single string,
+which is the body itself.
+
+The snapshot reports what this is buying under `storage`: what the record
+holds in total and how much of that is payload, how many blobs, how many unit
+references across every request, and the ratio between the two. On a scripted
+80-turn conversation the payload figure is 1.4 MiB for 118.9 MiB forwarded;
+`docs/measurements/raw-payload-capture.md` has the numbers and the method.
+
+One request will not take the session down with it: nothing Tap reads grows
+past 32MB. A response that reaches the limit keeps what arrived before it; a
+request body that would exceed it is dropped whole, because half a payload
+presented as a payload is worse than a recorded absence. Either way a
+diagnostic says what happened. The record as a whole is not yet capped and
+evicts nothing — that is the next piece of work, and blobs are what it will
+act on.
 
 *Reaches the proxy* is the limit of what Tap can claim. Some of Claude Code's
 calls go to Anthropic whatever `ANTHROPIC_BASE_URL` says and never cross Tap

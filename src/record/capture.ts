@@ -39,8 +39,9 @@ export interface Capture {
  * down with it. Past the budget capture gives up and says so, keeping what
  * arrived before rather than dropping the lot.
  *
- * It bounds one request, not the record: the record grows with the Tap
- * session, knowingly, until #15 deduplicates it.
+ * It bounds one request, not the record. The record holds payloads
+ * content-addressed, so it grows with the conversation rather than with its
+ * square, but it is not itself capped and evicts nothing yet.
  */
 const BODY_BUDGET = 32 * 1024 * 1024;
 

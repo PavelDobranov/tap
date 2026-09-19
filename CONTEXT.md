@@ -86,19 +86,39 @@ _Avoid_: block, segment, part, chunk
 **Blob**:
 A stored unit, content-addressed by SHA-256 of its canonical JSON with
 position-dependent annotations such as `cache_control` stripped before hashing.
+Held uncompressed, and detached from the payload it was read out of — a
+substring that is still a slice of its payload keeps the whole payload alive.
 Blobs are what eviction acts on.
 _Avoid_: object, fragment, entry
 
+**Canonical JSON**:
+The one spelling of a value used for addressing: object keys ascending by
+UTF-16 code unit, arrays in their own order, no whitespace. Fixed, because the
+address of a unit is derived from it. Used for hashing only and never for
+reconstruction, so a value it spells lossily costs deduplication and cannot
+cost fidelity.
+_Avoid_: normalised JSON, serialised form
+
+**Annotation**:
+A position-dependent marking that says where a unit sits in a request rather
+than what it contains — `cache_control` above all, which Claude Code moves
+between requests. Cut before hashing and put back on the way out, so a message
+whose only change is a moved breakpoint is still one blob.
+_Avoid_: breakpoint (in code), marker, metadata
+
 **Skeleton**:
 A captured request with its units replaced by blob references, retaining the
-annotations that were stripped before hashing. Reconstruction from a skeleton
-and its blobs is exact.
+annotations that were stripped before hashing and the text around them exactly
+as it arrived. Reconstruction from a skeleton and its blobs is exact.
 _Avoid_: envelope, stub, manifest, normalised payload
 
 **Payload**:
-The request body exactly as it crossed the proxy, held verbatim in the record
-and byte-identical to what the upstream received. Every request has one,
-`other` included: the request Tap cannot read is the one worth having in full.
+The request body exactly as it crossed the proxy, byte-identical to what the
+upstream received. Every request has one, `other` included: the request Tap
+cannot read is the one worth having in full. It is *held* as a skeleton and
+blobs rather than verbatim — the representation is deduplicated, the bytes a
+reader gets back are not — and a request Tap cannot take apart has a skeleton
+of one literal part, which is verbatim.
 _Avoid_: body, request JSON, prompt
 
 **Interrupted**:

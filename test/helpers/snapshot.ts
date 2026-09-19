@@ -17,8 +17,11 @@ export interface SnapshotRequest {
   startedAt: string;
   completedAt: string | null;
   durationMs: number | null;
-  /** The request body exactly as it was forwarded, or null if none was kept. */
-  payload: string | null;
+  /**
+   * The request body as it was forwarded, held as text interleaved with
+   * references into the snapshot's blob map, or null if none was kept.
+   */
+  skeleton: SnapshotSkeleton | null;
   /** The response as it streamed: one entry per event, in arrival order. */
   rawResponse: string[];
   /** Whether the response ended without the upstream closing it cleanly. */
@@ -31,6 +34,31 @@ export interface SnapshotRequest {
   } | null;
 }
 
+/** A stored unit, as the snapshot presents it. */
+export interface SnapshotBlob {
+  json: string;
+  size: number;
+}
+
+/** One unit of a skeleton: a blob, plus the annotations cut out of it. */
+export interface SnapshotUnit {
+  blob: string;
+  annotations: { at: number; text: string }[];
+}
+
+export type SnapshotSkeleton = (string | SnapshotUnit)[];
+
+export interface SnapshotStorage {
+  /** Everything the record holds: payloads and response events both. */
+  recordSize: number;
+  /** The payload half of it, which is the half that is deduplicated. */
+  payloadSize: number;
+  responseSize: number;
+  blobCount: number;
+  referencedUnits: number;
+  deduplicationRatio: number;
+}
+
 export interface SnapshotDiagnostic {
   at: string;
   seq: number | null;
@@ -39,7 +67,32 @@ export interface SnapshotDiagnostic {
 
 export interface Snapshot {
   requests: SnapshotRequest[];
+  blobs: { [hash: string]: SnapshotBlob };
+  storage: SnapshotStorage;
   diagnostics: SnapshotDiagnostic[];
+}
+
+/**
+ * The payload a skeleton stands for. Written out here, from the documented
+ * shape alone, rather than imported from Tap: the claim under test is that a
+ * reader of the snapshot can get the original bytes back, and a test that
+ * called Tap's own reconstructor could not disagree with it.
+ */
+export function payloadOf(snapshot: Snapshot, request: SnapshotRequest): string | null {
+  if (request.skeleton === null) return null;
+  return request.skeleton
+    .map((part) => {
+      if (typeof part === "string") return part;
+      const { json } = snapshot.blobs[part.blob]!;
+      let restored = "";
+      let cursor = 0;
+      for (const { at, text } of part.annotations) {
+        restored += json.slice(cursor, at) + text;
+        cursor = at;
+      }
+      return restored + json.slice(cursor);
+    })
+    .join("");
 }
 
 export interface HttpAnswer {
