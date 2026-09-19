@@ -1,0 +1,29 @@
+{
+  "name": "tap",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Context forensics for Claude Code",
+  "type": "module",
+  "bin": {
+    "tap": "dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "prepack": "npm run build",
+    "build": "tsc -p tsconfig.build.json && chmod +x dist/cli.js",
+    "typecheck": "tsc -p tsconfig.json",
+    "check:no-native": "node scripts/check-no-native.mjs",
+    "pretest": "npm run build",
+    "test": "node --test test/"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.3"
+  }
+}
