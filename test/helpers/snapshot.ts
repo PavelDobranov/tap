@@ -68,6 +68,21 @@ export interface SnapshotStorage {
   blobCount: number;
   referencedUnits: number;
   deduplicationRatio: number;
+  /** The byte ceiling the record is held under. */
+  cap: number;
+  /** What reaching it has cost, exactly, however long the session ran. */
+  evictedBlobs: number;
+  evictedBytes: number;
+}
+
+/** One blob dropped to keep the record under its cap. */
+export interface SnapshotEviction {
+  at: string;
+  blob: string;
+  size: number;
+  /** The last request that referenced it: the age that made it the one to go. */
+  lastSeq: number;
+  references: number;
 }
 
 export interface SnapshotDiagnostic {
@@ -89,6 +104,8 @@ export interface Snapshot {
   threads: SnapshotThread[];
   blobs: { [hash: string]: SnapshotBlob };
   storage: SnapshotStorage;
+  /** The most recent evictions. The exact totals are in `storage`. */
+  evictions: SnapshotEviction[];
   diagnostics: SnapshotDiagnostic[];
 }
 
@@ -97,13 +114,21 @@ export interface Snapshot {
  * shape alone, rather than imported from Tap: the claim under test is that a
  * reader of the snapshot can get the original bytes back, and a test that
  * called Tap's own reconstructor could not disagree with it.
+ *
+ * A reference whose blob has been evicted becomes a marked hole, which is
+ * what the documented rule says a reader should put there: never nothing,
+ * which would read as a shorter conversation than the one that happened.
  */
 export function payloadOf(snapshot: Snapshot, request: SnapshotRequest): string | null {
   if (request.skeleton === null) return null;
   return request.skeleton
     .map((part) => {
       if (typeof part === "string") return part;
-      const { json } = snapshot.blobs[part.blob]!;
+      const held = snapshot.blobs[part.blob];
+      if (held === undefined) {
+        return `/* tap evicted this unit to stay under its cap: ${part.blob} */`;
+      }
+      const { json } = held;
       let restored = "";
       let cursor = 0;
       for (const { at, text } of part.annotations) {

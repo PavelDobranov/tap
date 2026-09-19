@@ -84,9 +84,28 @@ One request will not take the session down with it: nothing Tap reads grows
 past 32MB. A response that reaches the limit keeps what arrived before it; a
 request body that would exceed it is dropped whole, because half a payload
 presented as a payload is worse than a recorded absence. Either way a
-diagnostic says what happened. The record as a whole is not yet capped and
-evicts nothing — that is the next piece of work, and blobs are what it will
-act on.
+diagnostic says what happened.
+
+### The cap, and what it drops
+
+The record as a whole is capped too, at 256MB by default and wherever
+`--record-cap` puts it. Reaching the cap evicts blobs rather than refusing to
+capture: the oldest go first, where oldest means the least recently
+*referenced*, because every request resends the whole conversation and a
+system block first seen in turn one is still in use in turn fifty.
+
+Nothing about that is silent. Every eviction is an event in the snapshot,
+`storage` reports how many blobs and bytes have gone, and a skeleton whose
+blob is no longer held reconstructs to a marked hole naming the address that
+went — never a gap, which would read as a shorter conversation than the one
+that happened, and never an error, which would lose the request along with the
+unit. Eviction is per blob, so one runaway tool result can go while the
+request that carried it stays readable.
+
+Response events are not blobs and are held whole until there is a reassembler
+to drop them, so a session whose responses alone exceed the cap will sit above
+it with nothing left to evict. `storage` states the cap beside the size, so
+that is visible rather than assumed.
 
 *Reaches the proxy* is the limit of what Tap can claim. Some of Claude Code's
 calls go to Anthropic whatever `ANTHROPIC_BASE_URL` says and never cross Tap
@@ -105,11 +124,15 @@ The browser page that renders all this is still to come, and with it the live
 stream that follows a snapshot: for now the JSON is the reader, and re-reading
 the URL is how you see what has happened since.
 
-Run several sessions at once by giving each its own UI port:
+Run several sessions at once by giving each its own UI port, and move the
+record's ceiling with `--record-cap`, which takes bytes or a size:
 
 ```sh
-tap launch --port 8271 claude
+tap launch --port 8271 --record-cap 512MB claude
 ```
+
+Tap reads its own options only in front of the agent name; everything from
+`claude` onwards belongs to the agent.
 
 ## Requirements
 

@@ -1,4 +1,10 @@
-import { createBlobs, type BlobMap, type PayloadStorage, type Skeleton } from "./blobs.ts";
+import {
+  createBlobs,
+  type BlobMap,
+  type Eviction as BlobEviction,
+  type PayloadStorage,
+  type Skeleton,
+} from "./blobs.ts";
 import { createThreads, type Thread } from "./threads.ts";
 
 /**
@@ -7,6 +13,7 @@ import { createThreads, type Thread } from "./threads.ts";
  * reconstruct a payload from it.
  */
 export {
+  evictedHole,
   reconstruct,
   type Annotation,
   type Blob,
@@ -140,16 +147,30 @@ export interface Diagnostic {
 }
 
 /**
- * What the record is costing, and what deduplication is saving it.
+ * One blob dropped to keep the record under its cap, as an event in the
+ * record. Eviction is never silent: a reader looking at a hole can find the
+ * moment it was made and the request whose payload last needed it.
+ */
+export interface Eviction extends BlobEviction {
+  readonly at: string;
+}
+
+/**
+ * What the record is costing, what deduplication is saving it, and what the
+ * cap has cost it.
  *
  * `recordSize` is the whole of it, payloads and responses both, because a
  * figure called the record's size that left out half the record is the kind
- * of number a reader acts on and should not have.
+ * of number a reader acts on and should not have. `cap` is the ceiling it is
+ * held under, so a reader can see how close the record is to evicting rather
+ * than having to find out from the first hole.
  */
 export interface Storage extends PayloadStorage {
   readonly recordSize: number;
   /** Bytes of response events held. Not deduplicated: every one is distinct. */
   readonly responseSize: number;
+  /** The byte ceiling the record is kept under. */
+  readonly cap: number;
 }
 
 /** The whole record as it stands. */
@@ -168,6 +189,14 @@ export interface Snapshot {
   readonly blobs: BlobMap;
   /** What holding them costs, and how much resending them is saving. */
   readonly storage: Storage;
+  /**
+   * The evictions the cap has forced, in the order they happened — the most
+   * recent of them, because a list that grew with the session would be one
+   * more unbounded hold in the part of Tap built to stop them. The exact
+   * totals are in `storage`, which never forgets, so a list that has dropped
+   * its own oldest entries understates the detail and never the fact.
+   */
+  readonly evictions: readonly Eviction[];
 
   readonly diagnostics: readonly Diagnostic[];
 }
@@ -208,6 +237,36 @@ export interface Entry {
 }
 
 /**
+ * How much of memory a Tap session will spend on what it has captured.
+ *
+ * Generous, and a ceiling rather than a target: the scripted eighty-turn
+ * baseline holds under two megabytes, so a session reaches this only through
+ * a pathological paste, a runaway tool result, or an afternoon of work — and
+ * where it does, the cost of holding it must not be the agent's process.
+ * Chosen to sit far above any ordinary session and far below a default Node
+ * heap, so the cap is what stops the record growing rather than the
+ * allocator.
+ */
+export const DEFAULT_RECORD_CAP = 256 * 1024 * 1024;
+
+/**
+ * How many eviction events the record keeps. The totals in `storage` are
+ * exact however many evictions there have been; this bounds the detail beside
+ * them, because a record capped precisely so that nothing in it grows without
+ * limit cannot then grow without limit by writing down its own evictions.
+ */
+const EVICTION_EVENTS = 1_000;
+
+/** What a record is built with. Everything here has a default. */
+export interface RecordOptions {
+  /**
+   * The byte ceiling for the whole record, payloads and responses both.
+   * Reaching it evicts blobs, oldest-first; it never refuses to capture.
+   */
+  readonly cap?: number;
+}
+
+/**
  * Everything Tap has captured in this Tap session, held in memory. There is no
  * store, no project and nothing on disk: the record is the whole of Tap's
  * state, and when Tap exits it is gone.
@@ -224,13 +283,35 @@ export interface Record {
   snapshot(): Snapshot;
 }
 
-export function createRecord(): Record {
+export function createRecord(options: RecordOptions = {}): Record {
+  const cap = options.cap ?? DEFAULT_RECORD_CAP;
   const requests: RecordedRequest[] = [];
   const diagnostics: Diagnostic[] = [];
+  const evictions: Eviction[] = [];
   const blobs = createBlobs();
   const threads = createThreads();
   /** Counted as events arrive, so a snapshot never re-measures the record. */
   let responseSize = 0;
+
+  /**
+   * Brings the record back under its cap, if the last thing held took it
+   * over. Blobs are the only thing there is to drop — the text left in
+   * skeletons is what makes a request legible without them, and the response
+   * events are what a cut stream leaves — so what is handed down is what is
+   * left of the cap once the responses have taken their share.
+   *
+   * Cheap when there is nothing to do, which is almost always, because this
+   * is on the path a request crosses: a comparison of two running totals.
+   */
+  const enforce = (): void => {
+    const evicted = blobs.evictTo(Math.max(cap - responseSize, 0));
+    if (evicted.length === 0) return;
+    const at = new Date().toISOString();
+    for (const eviction of evicted) {
+      evictions.push({ ...eviction, at });
+      if (evictions.length > EVICTION_EVENTS) evictions.shift();
+    }
+  };
 
   return {
     begin(method, endpoint) {
@@ -271,17 +352,19 @@ export function createRecord(): Record {
         type,
         observeModel: (model) => amend({ model }),
         observePayload: (payload) => {
-          const stored = blobs.store(payload, type);
+          const stored = blobs.store(payload, type, seq);
           // Attributed from the payload that was held, so the prefix a thread
           // is derived from is the prefix the record can show.
           amend({
             skeleton: stored.skeleton,
             thread: threads.attribute(seq, stored.messageAddresses),
           });
+          enforce();
         },
         observeRawResponse: (event) => {
           responseSize += Buffer.byteLength(event);
           rawResponse.push(event);
+          enforce();
         },
         observeStatus: (status) => amend({ status }),
         observeToolUse: (toolUse) => {
@@ -318,15 +401,16 @@ export function createRecord(): Record {
       })),
       threads: threads.list(),
       blobs: blobs.map(),
-      storage: measure(blobs.storage(), responseSize),
+      storage: measure(blobs.storage(), responseSize, cap),
+      evictions: [...evictions],
       diagnostics: [...diagnostics],
     }),
   };
 }
 
 /** The payload figures with the responses beside them, as the snapshot shows. */
-function measure(payload: PayloadStorage, responseSize: number): Storage {
-  return { ...payload, responseSize, recordSize: payload.payloadSize + responseSize };
+function measure(payload: PayloadStorage, responseSize: number, cap: number): Storage {
+  return { ...payload, responseSize, cap, recordSize: payload.payloadSize + responseSize };
 }
 
 /** The Anthropic endpoints Tap understands. Everything else is `other`. */

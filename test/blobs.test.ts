@@ -16,7 +16,7 @@ import type { RequestType } from "../src/record/record.ts";
 /** Round-trips a payload through a fresh store, as a snapshot reader would. */
 function roundTrip(payload: string, type: RequestType = "messages"): string {
   const blobs = createBlobs();
-  const { skeleton } = blobs.store(payload, type);
+  const { skeleton } = blobs.store(payload, type, 1);
   return reconstruct(skeleton, blobs.map());
 }
 
@@ -48,7 +48,7 @@ test("system, tools and each message are addressed in their own right", () => {
     ],
   });
 
-  const { skeleton } = blobs.store(payload, "messages");
+  const { skeleton } = blobs.store(payload, "messages", 1);
   const referenced = skeleton.filter((part) => typeof part !== "string");
   assert.equal(referenced.length, 4, "system, tools and two messages");
   assert.equal(Object.keys(blobs.map()).length, 4);
@@ -66,7 +66,7 @@ test("the same conversation resent holds one blob per distinct unit, not per req
     messages.push({ role: "user", content: `ask ${turn}` });
     messages.push({ role: "assistant", content: `answer ${turn}` });
     const payload = JSON.stringify({ model: "claude-opus-5", system, tools, messages });
-    skeletons.push(blobs.store(payload, "messages").skeleton);
+    skeletons.push(blobs.store(payload, "messages", turn + 1).skeleton);
   }
 
   const storage = blobs.storage();
@@ -85,8 +85,8 @@ test("a moved cache_control breakpoint does not make a second blob of the same m
     content: [{ type: "text", text: "hello", cache_control: { type: "ephemeral" } }],
   };
 
-  const first = blobs.store(JSON.stringify({ messages: [plain] }), "messages");
-  const second = blobs.store(JSON.stringify({ messages: [marked] }), "messages");
+  const first = blobs.store(JSON.stringify({ messages: [plain] }), "messages", 1);
+  const second = blobs.store(JSON.stringify({ messages: [marked] }), "messages", 2);
   assert.deepEqual(
     first.messageAddresses,
     second.messageAddresses,
@@ -115,7 +115,7 @@ test("a breakpoint is put back wherever it sat in the message", () => {
   for (const message of cases) {
     const payload = JSON.stringify({ messages: [message] });
     assert.equal(
-      reconstruct(blobs.store(payload, "messages").skeleton, blobs.map()),
+      reconstruct(blobs.store(payload, "messages", 1).skeleton, blobs.map()),
       payload,
       payload,
     );
@@ -146,7 +146,7 @@ test("what the store holds is reported, and it is less than it was shown", () =>
   const shown = [0, 1, 2].map((turn) => {
     const message = { role: "user", content: `ask ${turn}` };
     const payload = JSON.stringify({ system, messages: [message] });
-    blobs.store(payload, "messages");
+    blobs.store(payload, "messages", turn + 1);
     return Buffer.byteLength(payload);
   });
 
@@ -161,7 +161,7 @@ test("what the store holds is reported, and it is less than it was shown", () =>
 test("a body that is not json at all is still held whole", () => {
   const torn = '{"model":"claude-opus-5",';
   const blobs = createBlobs();
-  const { skeleton } = blobs.store(torn, "messages");
+  const { skeleton } = blobs.store(torn, "messages", 1);
   assert.deepEqual(skeleton, [torn], "unreadable is not the same as unrecorded");
   assert.equal(blobs.storage().blobCount, 0);
   assert.equal(reconstruct(skeleton, blobs.map()), torn);
@@ -203,7 +203,7 @@ test("reconstruction is byte-exact for arbitrary bodies of the right shape", () 
       messages: Array.from({ length: Math.floor(random() * 5) }, () => value(3)),
     });
     assert.equal(
-      reconstruct(blobs.store(payload, "messages").skeleton, blobs.map()),
+      reconstruct(blobs.store(payload, "messages", round + 1).skeleton, blobs.map()),
       payload,
       payload,
     );
@@ -228,7 +228,7 @@ test("a stored blob does not keep the payload it was read out of alive", () => {
   const system = [{ type: "text", text: "s".repeat(1_000_000) }];
   for (let request = 0; request < 50; request += 1) {
     const message = { role: "user", content: `ask ${request}` };
-    blobs.store(JSON.stringify({ system, messages: [message] }), "messages");
+    blobs.store(JSON.stringify({ system, messages: [message] }), "messages", request + 1);
   }
 
   const { payloadSize } = blobs.storage();
@@ -252,6 +252,6 @@ test("a payload nested past what reading it can walk is kept whole, not lost", (
   const payload = `{"messages":[${deep}],"system":"fine"}`;
 
   const blobs = createBlobs();
-  const { skeleton } = blobs.store(payload, "messages");
+  const { skeleton } = blobs.store(payload, "messages", 1);
   assert.equal(reconstruct(skeleton, blobs.map()), payload);
 });

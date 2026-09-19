@@ -41,6 +41,11 @@ export interface ProbeOptions {
    * decide, which is the point.
    */
   readonly concurrently?: boolean;
+  /**
+   * Options for `tap launch` itself, in front of the agent name — which is
+   * the only place Tap reads its own options.
+   */
+  readonly tapArgs?: readonly string[];
 }
 
 export interface Prober {
@@ -75,7 +80,7 @@ export function createProber(name: string): Prober {
 
     async probe(script, upstreamBaseUrl, until = "frozen", options = {}) {
       const file = path.join(scratch, `probe-${files++}.json`);
-      const session = await startLaunch(["claude"], {
+      const session = await startLaunch([...(options.tapArgs ?? []), "claude"], {
         env: {
           PATH: agent.pathEnv,
           ANTHROPIC_BASE_URL: upstreamBaseUrl,

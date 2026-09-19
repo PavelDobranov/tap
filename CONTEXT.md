@@ -139,10 +139,25 @@ The final message object rebuilt from the raw response for reading.
 _Avoid_: parsed response, final response, rendered response
 
 **Eviction**:
-Dropping the oldest blobs when the record reaches its memory cap. Always shown
-in the UI, never silent, because a missing record read as an absent event is
-the one failure that produces a confident wrong conclusion.
+Dropping the oldest blobs when the record reaches its memory cap. Oldest is by
+*last* reference, not first: every request resends the whole conversation, so
+the unit first seen in turn one may be the one every later request needs.
+Always shown in the UI, never silent, because a missing record read as an
+absent event is the one failure that produces a confident wrong conclusion.
 _Avoid_: pruning, trimming, rotation, GC
+
+**Cap**:
+The byte ceiling on the whole record, payloads and responses both, with a
+default and a `--record-cap` to move it. Not the per-body budget, which asks
+whether Tap can hold one payload at all; this asks what a session may cost.
+_Avoid_: limit, budget, quota, maximum
+
+**Hole**:
+What an evicted unit leaves in a reconstructed payload: a marked span naming
+the address that is gone. Deliberately not JSON, so a payload with a hole in
+it fails to parse rather than parsing into a shorter conversation than the one
+that happened.
+_Avoid_: placeholder, stub, elision, gap
 
 **Diagnostic**:
 A recorded failure of capture itself, surfaced in the UI alongside the record.

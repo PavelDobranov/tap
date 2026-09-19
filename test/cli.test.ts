@@ -48,3 +48,15 @@ test("an unrecognised flag exits nonzero with a clear message", async () => {
   assert.notEqual(result.code, 0);
   assert.match(result.stderr, /unknown option: --nope/i);
 });
+
+test("--record-cap takes a size, in either spelling", async () => {
+  const spellings = [
+    ["launch", "--record-cap", "notasize", "claude"],
+    ["launch", "--record-cap=0"],
+  ];
+  for (const argv of spellings) {
+    const result = await runTap(argv);
+    assert.notEqual(result.code, 0);
+    assert.match(result.stderr, /--record-cap needs a size/);
+  }
+});

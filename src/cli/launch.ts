@@ -66,7 +66,9 @@ export async function launch(argv: readonly string[], io: Io): Promise<number> {
   }
 
   const upstream = resolveUpstream(process.env);
-  const record = createRecord();
+  const record = createRecord(
+    options.recordCap === undefined ? {} : { cap: options.recordCap },
+  );
 
   let ui;
   try {

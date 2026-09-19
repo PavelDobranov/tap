@@ -20,7 +20,7 @@ export interface Command {
 export const COMMANDS: readonly Command[] = [
   {
     name: "launch",
-    synopsis: "launch [--port <n>] [claude] [...agent args]",
+    synopsis: "launch [--port <n>] [--record-cap <size>] [claude] [...agent args]",
     summary: "Run an agent and inspect its provider traffic live",
     run: launch,
   },

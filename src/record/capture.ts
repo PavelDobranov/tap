@@ -40,9 +40,10 @@ export interface Capture {
  * down with it. Past the budget capture gives up and says so, keeping what
  * arrived before rather than dropping the lot.
  *
- * It bounds one request, not the record. The record holds payloads
- * content-addressed, so it grows with the conversation rather than with its
- * square, but it is not itself capped and evicts nothing yet.
+ * It bounds one request, not the record. The record has a cap of its own and
+ * evicts blobs to stay under it; these two are not the same limit and not
+ * meant to be — this one asks whether Tap can hold one body at all, and the
+ * record's asks what the whole session may cost.
  */
 const BODY_BUDGET = 32 * 1024 * 1024;
 

@@ -14,8 +14,22 @@ export interface Blob {
    * address; only the bytes that arrived can be handed back.
    */
   readonly json: string;
-  /** What holding it costs, in bytes. What eviction will weigh. */
+  /** What holding it costs, in bytes. What eviction weighs. */
   readonly size: number;
+}
+
+/** One blob dropped to get the record back under its cap. */
+export interface Eviction {
+  /** The address that is no longer there, and is now a hole in a skeleton. */
+  readonly blob: string;
+  readonly size: number;
+  /**
+   * The last request that referenced it: this blob's age, and the reason it
+   * was the one to go.
+   */
+  readonly lastSeq: number;
+  /** Skeletons that referred to it, and so now reconstruct to a hole. */
+  readonly references: number;
 }
 
 /** A cut annotation and where it goes back into a blob's JSON. */
@@ -70,12 +84,17 @@ export interface Stored {
   readonly messageAddresses: readonly string[];
 }
 
-/** What deduplication is costing and saving. */
+/** What deduplication is costing and saving, and what eviction has dropped. */
 export interface PayloadStorage {
   /** Bytes of payload held: every blob, plus the text left in skeletons. */
   readonly payloadSize: number;
   readonly blobCount: number;
-  /** Unit references across every skeleton, duplicates counted every time. */
+  /**
+   * References to blobs the record still holds, across every skeleton,
+   * duplicates counted every time. An evicted blob takes its references with
+   * it, so this counts what can still be read back rather than overstating
+   * what a shrinking store is saving.
+   */
   readonly referencedUnits: number;
   /**
    * Units per blob: 1 is no deduplication at all, and higher is better. This
@@ -84,6 +103,9 @@ export interface PayloadStorage {
    * saving being quietly overstated.
    */
   readonly deduplicationRatio: number;
+  /** Blobs evicted since the session began. Never reset, never rolled up. */
+  readonly evictedBlobs: number;
+  readonly evictedBytes: number;
 }
 
 /**
@@ -102,16 +124,39 @@ export interface Blobs {
    * Total: a payload that cannot be taken apart becomes a skeleton of one
    * literal part, which is the verbatim behaviour this replaced.
    */
-  store(payload: string, type: RequestType): Stored;
+  store(payload: string, type: RequestType, seq: number): Stored;
   map(): BlobMap;
   storage(): PayloadStorage;
+  /**
+   * Drops blobs, oldest first, until what is held is at most `cap` bytes, and
+   * hands back what went so the record can write it down.
+   *
+   * Oldest means least recently referenced. A blob's first reference says
+   * nothing about whether it is still live: every `/v1/messages` request
+   * resends the whole conversation, so the system block of a session in its
+   * fiftieth turn was first seen in its first one, and evicting by first
+   * reference would drop exactly the units every remaining request needs.
+   *
+   * The cap can be unreachable — the text left in skeletons is not evictable,
+   * and neither are the response events held against the same ceiling — in
+   * which case this drops every blob it has and stops there. Dropping more
+   * than getting under it needs would be its own kind of dishonesty.
+   */
+  evictTo(cap: number): readonly Eviction[];
 }
 
 export function createBlobs(): Blobs {
-  const blobs = new Map<string, Blob>();
+  /**
+   * Insertion-ordered, and re-inserted on every reference, so iterating it
+   * walks the blobs in the order they were last referenced: least recently
+   * first, which is the order eviction wants.
+   */
+  const blobs = new Map<string, Held>();
   let blobBytes = 0;
   let literalBytes = 0;
   let referencedUnits = 0;
+  let evictedBlobs = 0;
+  let evictedBytes = 0;
 
   /**
    * Holds one unit, and hands back its address and, where it could be held as
@@ -124,7 +169,7 @@ export function createBlobs(): Blobs {
    * a unit that could not be deduplicated is still a unit whose content can be
    * compared with another request's, which is what thread attribution needs.
    */
-  const intern = (payload: string, unit: Span, cuts: readonly Span[]): Interned => {
+  const intern = (payload: string, unit: Span, cuts: readonly Span[], seq: number): Interned => {
     const { json, annotations } = cut(payload, unit, cuts);
 
     let hash: string;
@@ -144,13 +189,20 @@ export function createBlobs(): Blobs {
     const held = blobs.get(hash);
     if (held === undefined) {
       const detached = detach(json);
-      blobs.set(hash, { json: detached.text, size: detached.size });
+      blobs.set(hash, { json: detached.text, size: detached.size, lastSeq: seq, references: 1 });
       blobBytes += detached.size;
     } else if (held.json !== json) {
       // Two spellings of one content: canonical JSON says they are the same
       // unit, but only one of them can be the bytes this blob hands back.
       // Addressing is an optimisation; the bytes are the record.
       return { address: hash, reference: null };
+    } else {
+      // Referenced again, so it is the newest thing here: back to the end of
+      // the queue eviction reads from the front of.
+      held.lastSeq = seq;
+      held.references += 1;
+      blobs.delete(hash);
+      blobs.set(hash, held);
     }
 
     referencedUnits += 1;
@@ -158,7 +210,7 @@ export function createBlobs(): Blobs {
   };
 
   return {
-    store(payload, type) {
+    store(payload, type, seq) {
       const located = type === "other" ? null : locate(payload);
       if (located === null) {
         // Already its own string, so there is nothing to detach it from.
@@ -184,7 +236,7 @@ export function createBlobs(): Blobs {
         const cuts = located.annotations.filter(
           (span) => span.from >= unit.from && span.to <= unit.to,
         );
-        const { address, reference } = intern(payload, unit, cuts);
+        const { address, reference } = intern(payload, unit, cuts, seq);
         if (unit.message) messageAddresses.push(address);
         if (reference === null) {
           literal += payload.slice(unit.from, unit.to);
@@ -199,7 +251,10 @@ export function createBlobs(): Blobs {
       return { skeleton: parts, messageAddresses };
     },
 
-    map: () => Object.fromEntries(blobs),
+    map: () =>
+      Object.fromEntries(
+        [...blobs].map(([hash, { json, size }]) => [hash, { json, size }] as const),
+      ),
 
     storage: () => ({
       payloadSize: blobBytes + literalBytes,
@@ -208,8 +263,44 @@ export function createBlobs(): Blobs {
       // Rounded, because this is a number a reader eyeballs rather than one
       // anything computes from.
       deduplicationRatio: blobs.size === 0 ? 0 : round(referencedUnits / blobs.size),
+      evictedBlobs,
+      evictedBytes,
     }),
+
+    evictTo(cap) {
+      const evicted: Eviction[] = [];
+      for (const [blob, held] of blobs) {
+        if (blobBytes + literalBytes <= cap) break;
+        blobs.delete(blob);
+        blobBytes -= held.size;
+        referencedUnits -= held.references;
+        evictedBlobs += 1;
+        evictedBytes += held.size;
+        evicted.push({
+          blob,
+          size: held.size,
+          lastSeq: held.lastSeq,
+          references: held.references,
+        });
+      }
+      return evicted;
+    },
   };
+}
+
+/** A blob as the store holds it: the snapshot sees only the first two fields. */
+interface Held extends Blob {
+  /** The last request to reference it. Its age, for eviction. */
+  lastSeq: number;
+  /**
+   * How many skeleton references point at it, across the whole record. Eviction
+   * takes them with the blob, so the deduplication figures describe what can
+   * still be read back. A unit evicted and then resent comes back as a new
+   * blob, and the skeletons that referred to the old one — which the new one
+   * has the same address as, and so fills again — are not counted a second
+   * time: the count understates the saving there rather than overstating it.
+   */
+  references: number;
 }
 
 /** A held unit: its address, and the reference standing in for it if it has one. */
@@ -238,18 +329,36 @@ function cut(
 }
 
 /**
+ * What stands in a reconstructed payload where an evicted unit used to be.
+ *
+ * Part of the snapshot's documented interface, and deliberately not JSON: a
+ * payload with a hole in it must fail to parse rather than parse into
+ * something that looks like a shorter conversation than the one that
+ * happened. It names the address so a reader can tie the hole to the eviction
+ * event that made it.
+ */
+export function evictedHole(hash: string): string {
+  return `/* tap evicted this unit to stay under its cap: ${hash} */`;
+}
+
+/**
  * A payload as it arrived, from its skeleton and the blobs it refers to.
  *
  * The inverse of `store`, and exactly as documented an interface: a reader of
  * the snapshot — the UI, or anything else — reconstructs with this rule and
  * gets the bytes the upstream received.
+ *
+ * Except where a unit has been evicted, where it gets the bytes with a marked
+ * hole in their place. That is the whole of the concession: never a throw,
+ * which would lose the request along with the unit, and never a silent gap,
+ * which is the failure that makes a reader draw a confident wrong conclusion.
  */
 export function reconstruct(skeleton: Skeleton, blobs: BlobMap): string {
   return skeleton
     .map((part) => {
       if (typeof part === "string") return part;
       const blob = blobs[part.blob];
-      if (blob === undefined) throw new Error(`the record no longer holds blob ${part.blob}`);
+      if (blob === undefined) return evictedHole(part.blob);
       return restore(blob.json, part.annotations);
     })
     .join("");
