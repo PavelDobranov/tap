@@ -49,7 +49,11 @@ test("an unrecognised flag exits nonzero with a clear message", async () => {
   assert.match(result.stderr, /unknown option: --nope/i);
 });
 
-for (const command of commands) {
+// Commands whose milestone has not arrived yet; each one moves out of this
+// list as it is implemented.
+const unimplemented = commands.filter((command) => command !== "list");
+
+for (const command of unimplemented) {
   test(`${command} is recognised and reports that it is not implemented yet`, async () => {
     const result = await runTap([command]);
 

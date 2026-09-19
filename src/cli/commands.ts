@@ -1,9 +1,17 @@
+import { list } from "./list.ts";
+import type { Io } from "./io.ts";
+
+/** Runs a command with its own argv (everything after the command name). */
+export type Handler = (argv: readonly string[], io: Io) => number | Promise<number>;
+
 /** A `tap` subcommand, as it appears in usage and in dispatch. */
 export interface Command {
   readonly name: string;
   /** The command line as a user would type it, shown in the usage screen. */
   readonly synopsis: string;
   readonly summary: string;
+  /** Absent until the milestone that implements the command. */
+  readonly run?: Handler;
 }
 
 export const COMMANDS: readonly Command[] = [
@@ -16,6 +24,7 @@ export const COMMANDS: readonly Command[] = [
     name: "list",
     synopsis: "list [--stats]",
     summary: "List this project's recorded sessions",
+    run: list,
   },
   {
     name: "show",

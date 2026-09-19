@@ -49,8 +49,11 @@ function exitCodeOf(error: (Error & { code?: unknown; signal?: unknown }) | null
 /**
  * Runs the built `tap` executable — the one seam the test suite uses.
  */
-export function runTap(args: string[]): Promise<RunResult> {
-  return run(fileURLToPath(new URL("dist/cli.js", repoRoot)), args);
+export function runTap(
+  args: string[],
+  options: { cwd?: string; env?: NodeJS.ProcessEnv } = {},
+): Promise<RunResult> {
+  return run(fileURLToPath(new URL("dist/cli.js", repoRoot)), args, options);
 }
 
 export function readManifest(): {

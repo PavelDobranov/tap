@@ -4,8 +4,17 @@ Context forensics for Claude Code. `tap launch claude` records every request
 Claude Code sends to the provider, so you can read afterwards what the model was
 actually given.
 
-Nothing is implemented yet beyond the CLI skeleton — each command currently
-reports that it is not implemented.
+`tap list` works: it resolves the project you are standing in, creates its
+store on first use, and prints its session table — empty until `tap launch`
+exists to record one. The other commands still report that they are not
+implemented.
+
+## Project identity and storage
+
+A project is its git repository root, falling back to the working directory
+outside a repository, so running from a subdirectory reads the same project.
+Captures live entirely outside the repository, under `~/.tap/projects/<hash>`,
+mode 0700 — nothing is ever written into the working tree.
 
 ## Requirements
 

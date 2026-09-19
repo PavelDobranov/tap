@@ -1,15 +1,6 @@
 import { COMMANDS, commandNames, findCommand } from "./commands.ts";
+import { EXIT_FAILURE, EXIT_OK, EXIT_USAGE, type Io } from "./io.ts";
 import { readVersion } from "../version.ts";
-
-export interface Io {
-  readonly stdout: NodeJS.WritableStream;
-  readonly stderr: NodeJS.WritableStream;
-}
-
-/** Exit codes. Usage errors are distinguished from a command that ran and failed. */
-export const EXIT_OK = 0;
-export const EXIT_FAILURE = 1;
-export const EXIT_USAGE = 2;
 
 export function usage(): string {
   const lines = [
@@ -62,8 +53,10 @@ export async function run(argv: readonly string[], io: Io): Promise<number> {
     return EXIT_USAGE;
   }
 
-  // Later milestones replace this with the command's own handler, passing it
-  // argv.slice(1).
-  io.stderr.write(`tap: ${command.name} is not implemented yet.\n`);
-  return EXIT_FAILURE;
+  if (command.run === undefined) {
+    io.stderr.write(`tap: ${command.name} is not implemented yet.\n`);
+    return EXIT_FAILURE;
+  }
+
+  return command.run(argv.slice(1), io);
 }
