@@ -9,11 +9,11 @@ import { readManifest, repoRoot, run } from "./helpers/run-tap.ts";
 const pkg = readManifest();
 const root = fileURLToPath(repoRoot);
 
-// node:sqlite is available without a runtime flag from Node 24 onwards, and
-// Tap's persistence depends on it.
+// Tap runs its TypeScript sources directly, which needs type stripping without
+// a runtime flag: Node 24 onwards.
 const MINIMUM_NODE_MAJOR = 24;
 
-test("a minimum Node version supporting the built-in SQLite module is declared", () => {
+test("a minimum supported Node version is declared", () => {
   const range = pkg.engines?.node;
   assert.ok(range, "package.json must declare engines.node");
   const match = /^>=\s*(\d+)/.exec(range);

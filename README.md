@@ -1,25 +1,19 @@
 # tap
 
-Context forensics for Claude Code. `tap launch claude` records every request
-Claude Code sends to the provider, so you can read afterwards what the model was
-actually given.
+A live network inspector for Claude Code. `tap launch claude` runs the agent
+normally and opens a local web UI showing every request it sends to the
+provider and every response that comes back, as it happens.
 
-`tap list` works: it resolves the project you are standing in, creates its
-store on first use, and prints its session table — empty until `tap launch`
-exists to record one. The other commands still report that they are not
-implemented.
+Nothing is written to disk. The record lives in memory for the life of the
+session: when Tap exits, it is gone. That is what makes Tap safe to leave
+switched on in a repository full of secrets.
 
-## Project identity and storage
-
-A project is its git repository root, falling back to the working directory
-outside a repository, so running from a subdirectory reads the same project.
-Captures live entirely outside the repository, under `~/.tap/projects/<hash>`,
-mode 0700 — nothing is ever written into the working tree.
+`tap launch` is not implemented yet; the CLI reports as much.
 
 ## Requirements
 
-Node >= 24. Tap uses the Node runtime's built-in SQLite module and has no native
-dependencies, so installing it never compiles anything.
+Node >= 24. Tap has no native dependencies, so installing it never compiles
+anything.
 
 ## Development
 

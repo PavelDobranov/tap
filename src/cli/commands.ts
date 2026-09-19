@@ -1,4 +1,3 @@
-import { list } from "./list.ts";
 import type { Io } from "./io.ts";
 
 /** Runs a command with its own argv (everything after the command name). */
@@ -14,32 +13,15 @@ export interface Command {
   readonly run?: Handler;
 }
 
+/**
+ * Tap is one command. The record lives in memory for the life of a session and
+ * is read in the browser, so there is nothing to list, show, export or delete.
+ */
 export const COMMANDS: readonly Command[] = [
   {
     name: "launch",
     synopsis: "launch [claude] [...agent args]",
-    summary: "Run an agent with its provider traffic recorded",
-  },
-  {
-    name: "list",
-    synopsis: "list [--stats]",
-    summary: "List this project's recorded sessions",
-    run: list,
-  },
-  {
-    name: "show",
-    synopsis: "show [session] [n] [--diff] [--json] [--system] [--tools] [--full] [--all-types]",
-    summary: "Render a session's requests, or one request in full",
-  },
-  {
-    name: "export",
-    synopsis: "export [session] [--format md|json]",
-    summary: "Write a session's rendering to a file",
-  },
-  {
-    name: "rm",
-    synopsis: "rm <session> | --project",
-    summary: "Delete a session's captures, or the whole project's",
+    summary: "Run an agent and inspect its provider traffic live",
   },
 ];
 

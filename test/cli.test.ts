@@ -4,7 +4,7 @@ import { readManifest, runTap } from "./helpers/run-tap.ts";
 
 const pkg = readManifest();
 
-const commands = ["launch", "list", "show", "export", "rm"];
+const commands = ["launch"];
 
 test("with no arguments prints usage and exits 0", async () => {
   const result = await runTap([]);
@@ -51,7 +51,7 @@ test("an unrecognised flag exits nonzero with a clear message", async () => {
 
 // Commands whose milestone has not arrived yet; each one moves out of this
 // list as it is implemented.
-const unimplemented = commands.filter((command) => command !== "list");
+const unimplemented = commands;
 
 for (const command of unimplemented) {
   test(`${command} is recognised and reports that it is not implemented yet`, async () => {
