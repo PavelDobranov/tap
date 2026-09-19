@@ -155,7 +155,7 @@ test("a stream cut mid-response keeps what it got, and says it was cut", async (
   );
   assert.deepEqual(captured.usage, { inputTokens: 417, cacheReadInputTokens: 3840, outputTokens: 1 });
 
-  // The agent saw the same truncated stream Tap recorded, and Tap did not
+  // The agent saw the same cut stream Tap recorded, and Tap did not
   // invent an ending for either of them.
   assert.equal(transcript().responses[0]!.body, delivered.map((chunk) => chunk.text).join(""));
 

@@ -51,8 +51,11 @@ Holding all that verbatim is expensive: every request resends the whole
 conversation, so the record grows with the square of the conversation length.
 That is knowingly the case for now — `docs/measurements/raw-payload-capture.md`
 records what it costs — and is what content-addressed storage fixes next. One
-request will not take the session down with it in the meantime: past a 32MB
-hold, capture keeps what arrived and says in a diagnostic that it stopped.
+request will not take the session down with it in the meantime: nothing Tap
+holds grows past 32MB. A response that reaches the limit keeps what arrived
+before it; a request body that would exceed it is dropped whole, because half
+a payload presented as a payload is worse than a recorded absence. Either way
+a diagnostic says what happened.
 
 *Reaches the proxy* is the limit of what Tap can claim. Some of Claude Code's
 calls go to Anthropic whatever `ANTHROPIC_BASE_URL` says and never cross Tap

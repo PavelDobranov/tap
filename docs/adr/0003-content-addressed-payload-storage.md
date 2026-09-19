@@ -42,3 +42,8 @@ the blob map. `docs/measurements/raw-payload-capture.md` records what the
 interim costs, so the scheme is held to a measured number rather than to the
 argument above. Until then the Blob and Skeleton entries in `CONTEXT.md`
 describe where the record is going, and the Payload entry describes where it is.
+
+It follows that the record is also, for now, uncapped and evicts nothing, which
+ADR-0005 says it must do. Eviction acts on blobs, so it cannot exist before the
+blob map does: the 32MB budget in capture bounds any single body or response
+and never the record as a whole. #15 restores both together.
