@@ -1,86 +1,19 @@
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { connect } from "node:net";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { networkInterfaces, tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
-import { setTimeout as delay } from "node:timers/promises";
 import { after, test } from "node:test";
 import { createFakeAgent, PROBE_AGENT } from "./helpers/fake-agent.ts";
-import type { ProbeStep, ProbeTranscript } from "./helpers/fake-agent.ts";
-import {
-  fixtureBody,
-  readSseFixture,
-  startFakeUpstream,
-  type UpstreamPlan,
-} from "./helpers/fake-upstream.ts";
-import { startTap, type TapSession } from "./helpers/run-tap.ts";
+import { fixtureBody, readSseFixture } from "./helpers/fake-upstream.ts";
+import { freePort, killAllSessions, startTap } from "./helpers/run-tap.ts";
+import { createProber, quit, responds } from "./helpers/session.ts";
 
-const agent = createFakeAgent(PROBE_AGENT);
-after(() => agent.remove());
-
-const scratch = mkdtempSync(path.join(tmpdir(), "tap-proxy-"));
-after(() => rmSync(scratch, { recursive: true, force: true }));
-
-let probeFiles = 0;
-
-interface Probed {
-  readonly transcript: ProbeTranscript;
-  readonly session: TapSession;
-  /** The proxy's port, taken from the base URL the agent was handed. */
-  readonly proxyPort: number;
-}
-
-/**
- * Runs one Tap session whose agent is the probe, and reads its transcript.
- *
- * `stay` leaves the agent running once it has written the transcript, for the
- * assertions that need a live session; otherwise the session is read frozen.
- */
-async function probe(
-  script: readonly ProbeStep[],
-  upstreamBaseUrl: string,
-  options: { stay?: boolean } = {},
-): Promise<Probed> {
-  const file = path.join(scratch, `probe-${probeFiles++}.json`);
-  const session = startTap(["launch", "claude"], {
-    env: {
-      PATH: agent.pathEnv,
-      ANTHROPIC_BASE_URL: upstreamBaseUrl,
-      FAKE_AGENT_PROBE_FILE: file,
-      FAKE_AGENT_PROBE_SCRIPT: JSON.stringify(script),
-      ...(options.stay === true ? { FAKE_AGENT_PROBE_STAY: "1" } : {}),
-    },
-  });
-
-  if (options.stay === true) await waitForFile(file);
-  else await session.waitForError(/frozen/);
-
-  const transcript = JSON.parse(readFileSync(file, "utf8")) as ProbeTranscript;
-  return { transcript, session, proxyPort: Number(new URL(transcript.baseUrl).port) };
-}
-
-/** Ends a session the way a user does, and waits for Tap to go. */
-async function quit(session: TapSession): Promise<void> {
-  await session.waitForError(/frozen/);
-  session.interrupt();
-  await session.exited;
-}
-
-async function waitForFile(file: string): Promise<void> {
-  for (let waited = 0; waited < 10_000; waited += 20) {
-    if (existsSync(file)) return;
-    await delay(20);
-  }
-  throw new Error(`timed out waiting for ${file}`);
-}
-
-/** Starts a fake upstream that is torn down with the test file. */
-async function upstream(plan: UpstreamPlan) {
-  const server = await startFakeUpstream(plan);
-  after(() => server.close());
-  return server;
-}
+const tap = createProber("proxy");
+after(() => tap.dispose());
+after(killAllSessions);
 
 /** Whether anything is listening at an address, without sending a request. */
 function reachable(host: string, port: number): Promise<boolean> {
@@ -106,8 +39,6 @@ function externalAddress(): string | undefined {
   return undefined;
 }
 
-const response = (body: string): UpstreamPlan => ({ body });
-
 /** A raw header list read back as the name/value pairs that arrived. */
 function rawPairs(raw: readonly string[]): [string, string][] {
   const pairs: [string, string][] = [];
@@ -125,13 +56,13 @@ function sourceFiles(dir: string): string[] {
 }
 
 test("the agent is pointed at Tap on the loopback address, not at the upstream", async () => {
-  const api = await upstream(response("{}"));
-  const { transcript, session, proxyPort } = await probe([{}], api.baseUrl);
+  const api = await tap.upstream(responds("{}"));
+  const { transcript, session, proxyPort } = await tap.probe([{}], api.baseUrl);
 
-  const base = new URL(transcript.baseUrl);
+  const base = new URL(transcript().baseUrl);
   assert.equal(base.protocol, "http:");
   assert.equal(base.hostname, "127.0.0.1");
-  assert.notEqual(proxyPort, Number(new URL(api.baseUrl).port));
+  assert.notEqual(proxyPort(), Number(new URL(api.baseUrl).port));
   assert.equal(api.requests.length, 1, "the request went through Tap");
 
   await quit(session);
@@ -144,12 +75,12 @@ test("the proxy is not reachable from off the loopback address", async (t) => {
     return;
   }
 
-  const api = await upstream(response("{}"));
-  const { session, proxyPort } = await probe([{}], api.baseUrl, { stay: true });
+  const api = await tap.upstream(responds("{}"));
+  const { session, proxyPort } = await tap.probe([{}], api.baseUrl, "transcript");
 
-  assert.equal(await reachable("127.0.0.1", proxyPort), true, "loopback should work");
+  assert.equal(await reachable("127.0.0.1", proxyPort()), true, "loopback should work");
   assert.equal(
-    await reachable(external, proxyPort),
+    await reachable(external, proxyPort()),
     false,
     "a wildcard bind would make Tap an open credential relay",
   );
@@ -159,9 +90,9 @@ test("the proxy is not reachable from off the loopback address", async (t) => {
 });
 
 test("request method, path, headers and body reach the upstream unaltered", async () => {
-  const api = await upstream(response("{}"));
+  const api = await tap.upstream(responds("{}"));
   const body = JSON.stringify({ model: "claude-opus-5", messages: [{ role: "user" }] });
-  const { session } = await probe(
+  const { session } = await tap.probe(
     [
       {
         method: "POST",
@@ -209,8 +140,8 @@ test("request method, path, headers and body reach the upstream unaltered", asyn
 });
 
 test("an upstream with a path of its own keeps it in front of the agent's", async () => {
-  const api = await upstream(response("{}"));
-  const { session } = await probe([{ path: "/v1/messages" }], `${api.baseUrl}/llm`);
+  const api = await tap.upstream(responds("{}"));
+  const { session } = await tap.probe([{ path: "/v1/messages" }], `${api.baseUrl}/llm`);
 
   assert.equal(api.requests[0]?.url, "/llm/v1/messages");
 
@@ -219,10 +150,10 @@ test("an upstream with a path of its own keeps it in front of the agent's", asyn
 
 test("a streamed response reaches the agent chunk for chunk, gaps and all", async () => {
   const fixture = readSseFixture("message-stream");
-  const api = await upstream({ stream: fixture });
-  const { transcript, session } = await probe([{}], api.baseUrl);
+  const api = await tap.upstream({ stream: fixture });
+  const { transcript, session } = await tap.probe([{}], api.baseUrl);
 
-  const received = transcript.responses[0]!;
+  const received = transcript().responses[0]!;
   assert.equal(received.error, undefined);
   assert.equal(received.status, fixture.status);
   assert.equal(received.headers["content-type"], fixture.headers["content-type"]);
@@ -250,8 +181,8 @@ test("a streamed response reaches the agent chunk for chunk, gaps and all", asyn
 
 test("the credential reaches the upstream verbatim and is never spoken of", async () => {
   const sentinel = "sk-ant-sentinel-0d2f4c7a9b1e";
-  const api = await upstream(response("{}"));
-  const { session } = await probe(
+  const api = await tap.upstream(responds("{}"));
+  const { session } = await tap.probe(
     [{ headers: { Authorization: `Bearer ${sentinel}` } }],
     api.baseUrl,
   );
@@ -288,14 +219,14 @@ test("no code in Tap so much as names the credential header", () => {
 
 test("a non-streaming response passes through unaltered", async () => {
   const body = JSON.stringify({ id: "msg_01", content: [{ type: "text", text: "hi" }] });
-  const api = await upstream({
+  const api = await tap.upstream({
     status: 200,
     headers: { "content-type": "application/json", "anthropic-request-id": "req_01" },
     body,
   });
-  const { transcript, session } = await probe([{}], api.baseUrl);
+  const { transcript, session } = await tap.probe([{}], api.baseUrl);
 
-  const received = transcript.responses[0]!;
+  const received = transcript().responses[0]!;
   assert.equal(received.status, 200);
   assert.equal(received.body, body);
   assert.equal(received.headers["content-type"], "application/json");
@@ -306,10 +237,10 @@ test("a non-streaming response passes through unaltered", async () => {
 
 test("an upstream error passes through unaltered", async () => {
   const body = JSON.stringify({ type: "error", error: { type: "overloaded_error" } });
-  const api = await upstream({ status: 529, headers: { "retry-after": "12" }, body });
-  const { transcript, session } = await probe([{}], api.baseUrl);
+  const api = await tap.upstream({ status: 529, headers: { "retry-after": "12" }, body });
+  const { transcript, session } = await tap.probe([{}], api.baseUrl);
 
-  const received = transcript.responses[0]!;
+  const received = transcript().responses[0]!;
   assert.equal(received.status, 529);
   assert.equal(received.body, body);
   assert.equal(received.headers["retry-after"], "12");
@@ -318,21 +249,25 @@ test("an upstream error passes through unaltered", async () => {
 });
 
 test("the proxy stops accepting requests once the agent has exited", async () => {
-  const api = await upstream(response("{}"));
-  const { session, proxyPort } = await probe([{}], api.baseUrl);
+  const api = await tap.upstream(responds("{}"));
+  const { session, proxyPort } = await tap.probe([{}], api.baseUrl);
 
   // The session is frozen here: the record would still be readable, but there
   // is no agent left to record, so nothing may still be forwarded upstream.
-  assert.equal(await reachable("127.0.0.1", proxyPort), false);
+  assert.equal(await reachable("127.0.0.1", proxyPort()), false);
 
   await quit(session);
-  assert.equal(await reachable("127.0.0.1", proxyPort), false);
+  assert.equal(await reachable("127.0.0.1", proxyPort()), false);
 });
 
 test("a refused configuration reaches neither the upstream nor the agent", async () => {
-  const api = await upstream(response("{}"));
-  const file = path.join(scratch, `probe-${probeFiles++}.json`);
-  const session = startTap(["launch", "claude"], {
+  const api = await tap.upstream(responds("{}"));
+  // A path nothing creates: the assertion is that the agent never ran, so the
+  // probe file having no chance to exist is exactly the point.
+  const file = path.join(tmpdir(), `tap-never-written-${randomUUID()}.json`);
+  const agent = createFakeAgent(PROBE_AGENT);
+  after(() => agent.remove());
+  const session = startTap(["launch", "--port", String(await freePort()), "claude"], {
     env: {
       PATH: agent.pathEnv,
       ANTHROPIC_BASE_URL: api.baseUrl,

@@ -65,6 +65,26 @@ function exitCodeOf(error: (Error & { code?: unknown; signal?: unknown }) | null
 }
 
 /**
+ * `tap launch` on a UI port of its own. Sessions run concurrently across the
+ * suite, and the UI's default port is fixed by design, so every test but the
+ * one asserting that default names a port — which is what `--port` is for.
+ */
+export async function runLaunch(
+  args: string[],
+  options: { cwd?: string; env?: NodeJS.ProcessEnv } = {},
+): Promise<RunResult> {
+  return runTap(["launch", "--port", String(await freePort()), ...args], options);
+}
+
+/** The same, for a session a test needs to watch rather than wait on. */
+export async function startLaunch(
+  args: string[],
+  options: { cwd?: string; env?: NodeJS.ProcessEnv } = {},
+): Promise<TapSession> {
+  return startTap(["launch", "--port", String(await freePort()), ...args], options);
+}
+
+/**
  * Runs the built `tap` executable — the one seam the test suite uses.
  */
 export function runTap(
@@ -105,6 +125,8 @@ export interface TapSession {
   type(line: string): void;
   /** Ctrl+C: SIGINT to the whole process group, tap and agent alike. */
   interrupt(): void;
+  /** Ends the session outright, for a test that has already failed. */
+  kill(): void;
   /** Resolves once `pattern` has appeared in stdout; rejects on a timeout. */
   waitForOutput(pattern: RegExp): Promise<void>;
   /** Resolves once `pattern` has appeared in stderr; rejects on a timeout. */
@@ -119,6 +141,19 @@ const WAIT_TIMEOUT_MS = 10_000;
  * deliver SIGINT to the group the way a terminal delivers Ctrl+C to the
  * foreground one.
  */
+/**
+ * Every session this file has started. A `tap` session outlives its agent by
+ * design, so an assertion that fails before the test quits its session would
+ * otherwise leave one running and the suite waiting on it forever.
+ */
+const started = new Set<TapSession>();
+
+/** Ends every session left behind. Call from an `after` hook in each file. */
+export function killAllSessions(): void {
+  for (const session of started) session.kill();
+  started.clear();
+}
+
 export function startTap(
   args: string[],
   options: { cwd?: string; env?: NodeJS.ProcessEnv } = {},
@@ -154,21 +189,27 @@ export function startTap(
     });
   });
 
-  return {
+  const signal = (which: NodeJS.Signals): void => {
+    try {
+      process.kill(-child.pid!, which);
+    } catch {
+      // Already gone; the assertions on `exited` say whether that was right.
+    }
+  };
+
+  const session: TapSession = {
     stdout: () => stdout,
     stderr: () => stderr,
     type: (line) => child.stdin.write(`${line}\n`),
-    interrupt: () => {
-      try {
-        process.kill(-child.pid!, "SIGINT");
-      } catch {
-        // Already gone; the assertions on `exited` say whether that was right.
-      }
-    },
+    interrupt: () => signal("SIGINT"),
+    kill: () => signal("SIGKILL"),
     waitForOutput: (pattern) => waitFor(pattern, "stdout", () => stdout),
     waitForError: (pattern) => waitFor(pattern, "stderr", () => stderr),
     exited,
   };
+  started.add(session);
+  void exited.then(() => started.delete(session));
+  return session;
 
   function waitFor(pattern: RegExp, stream: string, read: () => string): Promise<void> {
     return new Promise((resolve, reject) => {
@@ -189,4 +230,19 @@ export function startTap(
       check();
     });
   }
+}
+
+/**
+ * A loopback port nothing is listening on, for the tests that need to know the
+ * UI's address before Tap prints it. Bound and released rather than guessed, so
+ * a busy machine does not make the suite flaky.
+ */
+export async function freePort(): Promise<number> {
+  const { createServer } = await import("node:net");
+  const server = createServer();
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  const address = server.address();
+  if (address === null || typeof address === "string") throw new Error("no port");
+  await new Promise<void>((resolve) => server.close(() => resolve()));
+  return address.port;
 }

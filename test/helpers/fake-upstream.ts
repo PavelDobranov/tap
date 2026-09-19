@@ -49,7 +49,8 @@ export type UpstreamPlan =
   | {
       readonly status?: number;
       readonly headers?: Readonly<Record<string, string>>;
-      readonly body?: string;
+      /** A Buffer for a body that is not text, such as a compressed one. */
+      readonly body?: string | Buffer;
     };
 
 export interface FakeUpstream {

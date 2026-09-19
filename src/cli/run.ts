@@ -13,6 +13,11 @@ export function usage(): string {
   }
   lines.push(
     "",
+    "Launch options, which must come before the agent name:",
+    "  --port <n>  Serve the UI on this port instead of the default",
+  );
+  lines.push(
+    "",
     "Options:",
     "  --version  Print the version",
     "  --help     Print this usage",

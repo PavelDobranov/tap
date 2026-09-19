@@ -1,6 +1,7 @@
 import { createServer, request as httpRequest, type IncomingMessage, type ServerResponse } from "node:http";
 import { request as httpsRequest } from "node:https";
 import type { Socket } from "node:net";
+import type { Capture, RequestCapture } from "../record/capture.ts";
 
 /**
  * Headers that describe one hop of a connection rather than the message, and
@@ -38,9 +39,15 @@ export interface Proxy {
  * The proxy is a byte pipe: response chunks are written on as they arrive, so
  * a streamed response reaches the agent in the chunks and with the pauses the
  * upstream produced. Nothing is buffered, decoded or rewritten.
+ *
+ * `capture` watches what goes past and is never in the way of it. Every call
+ * into it is wrapped, so a capture that throws becomes a diagnostic and the
+ * agent's request carries on as if capture were not installed; and every call
+ * is made *after* the bytes have been handed on, so no capture work is ever
+ * awaited before a response chunk is forwarded.
  */
-export async function startProxy(upstream: URL): Promise<Proxy> {
-  const server = createServer((req, res) => forward(req, res, upstream));
+export async function startProxy(upstream: URL, capture: Capture): Promise<Proxy> {
+  const server = createServer((req, res) => forward(req, res, upstream, capture));
 
   // Nagle would gather chunks a streaming response deliberately spaced out,
   // making Tap look like a buffering proxy to the agent reading through it.
@@ -74,9 +81,16 @@ export async function startProxy(upstream: URL): Promise<Proxy> {
   };
 }
 
-function forward(req: IncomingMessage, res: ServerResponse, upstream: URL): void {
+function forward(
+  req: IncomingMessage,
+  res: ServerResponse,
+  upstream: URL,
+  capture: Capture,
+): void {
   const send = upstream.protocol === "https:" ? httpsRequest : httpRequest;
   const prefix = upstream.pathname.replace(/\/$/, "");
+
+  const captured = watch(capture, req);
 
   const outbound = send({
     protocol: upstream.protocol,
@@ -98,27 +112,77 @@ function forward(req: IncomingMessage, res: ServerResponse, upstream: URL): void
     // Sent before the first chunk, so the agent sees the response begin when
     // the upstream said it began rather than when its first byte arrives.
     res.flushHeaders();
+
+    // Piping first is what keeps the byte pipe a byte pipe: `pipe` installs
+    // its handler before this one, so every chunk is on its way to the agent
+    // before capture is shown a copy of it, and the agent keeps the
+    // backpressure it would have had without Tap.
     upstreamRes.pipe(res);
-    upstreamRes.on("error", () => res.destroy());
+    upstreamRes.on("data", (chunk: Buffer) => captured.responseChunk(chunk));
+    upstreamRes.on("end", () => captured.end());
+    upstreamRes.on("error", () => {
+      res.destroy();
+      captured.end();
+    });
+
+    captured.responseStart(upstreamRes.statusCode ?? 502, upstreamRes.headers);
   });
 
   outbound.on("error", () => {
     if (res.headersSent) {
       res.destroy();
-      return;
+    } else {
+      res.writeHead(502, { "content-type": "text/plain" });
+      res.end("tap: could not reach the upstream\n");
     }
-    res.writeHead(502, { "content-type": "text/plain" });
-    res.end("tap: could not reach the upstream\n");
+    // No status is recorded: the upstream never gave one, and inventing Tap's
+    // own 502 here would put a provider answer in the record that the provider
+    // never sent.
+    captured.end();
   });
 
   // An agent that gives up mid-request must not leave Tap holding the upstream
   // one open.
   res.on("close", () => {
     if (!res.writableEnded) outbound.destroy();
+    captured.end();
   });
 
   req.pipe(outbound);
+  req.on("data", (chunk: Buffer) => captured.requestChunk(chunk));
+  req.on("end", () => captured.requestEnd());
   req.on("error", () => outbound.destroy());
+}
+
+/**
+ * Opens capture for one request, behind a barrier nothing can throw through.
+ *
+ * Capture writes its own failures down as diagnostics, so there is nothing
+ * left for this to report: it exists only so that an exception escaping
+ * capture cannot escape into the agent's request. An invariant that depends on
+ * every call site remembering to wrap itself is not an invariant, so no
+ * unwrapped handle is handed out.
+ */
+function watch(capture: Capture, req: IncomingMessage): RequestCapture {
+  const opened = capture.begin(req.method ?? "", req.url ?? "");
+
+  const guarded = (step: () => void): void => {
+    try {
+      step();
+    } catch {
+      // Deliberately silent, and deliberately last: this is reached only if
+      // capture failed to record its own failure.
+    }
+  };
+
+  return {
+    requestChunk: (chunk) => guarded(() => opened.requestChunk(chunk)),
+    requestEnd: () => guarded(() => opened.requestEnd()),
+    responseStart: (status, headers) =>
+      guarded(() => opened.responseStart(status, headers)),
+    responseChunk: (chunk) => guarded(() => opened.responseChunk(chunk)),
+    end: () => guarded(() => opened.end()),
+  };
 }
 
 /** Inbound headers, minus the per-hop ones, keeping repeats as repeats. */

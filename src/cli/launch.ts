@@ -7,8 +7,12 @@ import {
 import { AgentNotFoundError, describeOutcome, runAgent } from "../agent/run.ts";
 import { startProxy } from "../proxy/proxy.ts";
 import { resolveUpstream } from "../proxy/upstream.ts";
+import { createCapture } from "../record/capture.ts";
+import { createRecord } from "../record/record.ts";
+import { DEFAULT_UI_PORT, PortInUseError, startUi } from "../ui/server.ts";
 import { exitOnInterrupt, ignoreSigint, restoreSigint } from "../signals.ts";
 import { EXIT_FAILURE, EXIT_OK, EXIT_USAGE, type Io } from "./io.ts";
+import { OptionError, readLaunchOptions } from "./options.ts";
 
 /**
  * Launches an agent and owns the Tap session around it: live while the agent
@@ -21,6 +25,10 @@ import { EXIT_FAILURE, EXIT_OK, EXIT_USAGE, type Io } from "./io.ts";
  * a port open that relays a credential upstream would be the wrong thing to
  * leave lying around for the length of a reading session.
  *
+ * The UI server has the opposite lifetime. It is bound first, so that a port
+ * clash ends the launch before an agent has been started and abandoned, and it
+ * is never closed: serving the record is what the frozen phase is for.
+ *
  * SIGINT is held from before the agent is spawned until the frozen session
  * takes it over, so there is no instant at which a Ctrl+C meant for the agent
  * can end Tap first.
@@ -30,10 +38,16 @@ import { EXIT_FAILURE, EXIT_OK, EXIT_USAGE, type Io } from "./io.ts";
  * where they were rather than in a session that would show nothing.
  */
 export async function launch(argv: readonly string[], io: Io): Promise<number> {
+  let options;
   let invocation;
   try {
-    invocation = readInvocation(argv);
+    options = readLaunchOptions(argv);
+    invocation = readInvocation(options.rest);
   } catch (error) {
+    if (error instanceof OptionError) {
+      io.stderr.write(`tap: ${error.message}\n`);
+      return EXIT_USAGE;
+    }
     if (!(error instanceof UnknownAgentError)) throw error;
     io.stderr.write(
       `tap: ${error.message}\n` + `The only agent tap can launch is ${CLAUDE}.\n`,
@@ -52,11 +66,28 @@ export async function launch(argv: readonly string[], io: Io): Promise<number> {
   }
 
   const upstream = resolveUpstream(process.env);
+  const record = createRecord();
+
+  let ui;
+  try {
+    ui = await startUi(record, options.port ?? DEFAULT_UI_PORT);
+  } catch (error) {
+    if (!(error instanceof PortInUseError)) throw error;
+    io.stderr.write(
+      `tap: ${error.message}\n` +
+        `Another tap may already be running; use --port to pick another.\n`,
+    );
+    return EXIT_FAILURE;
+  }
 
   // The proxy is bound before SIGINT is held: until there is an agent, a
   // Ctrl+C is meant for Tap, and a failed bind should end it like any other
   // startup failure.
-  const proxy = await startProxy(upstream);
+  const proxy = await startProxy(upstream, createCapture(record));
+
+  // The one line Tap writes before the agent has the terminal, and the last
+  // until the agent gives it back.
+  io.stderr.write(`tap: inspect this session at ${ui.url}\n`);
 
   let outcome;
   ignoreSigint();
@@ -64,6 +95,9 @@ export async function launch(argv: readonly string[], io: Io): Promise<number> {
     outcome = await runAgent(invocation, { ANTHROPIC_BASE_URL: proxy.baseUrl });
   } catch (error) {
     restoreSigint();
+    // Both ports go with the session: there is no agent to record and no
+    // record worth serving, and a Tap left holding them would never exit.
+    await ui.close();
     if (!(error instanceof AgentNotFoundError)) throw error;
     io.stderr.write(
       `tap: ${error.message}\n` + `Is ${error.command} installed and on your PATH?\n`,

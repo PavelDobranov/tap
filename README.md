@@ -18,7 +18,49 @@ Recording is bound to the agent's life; Tap is not. When the agent exits the
 session is frozen — nothing more is captured, and Tap stays up so the record
 remains readable — until you interrupt it.
 
-Capture itself is not implemented yet.
+## Reading the record
+
+Tap prints one line before the agent takes over, with the URL to read the
+session at:
+
+```
+tap: inspect this session at http://127.0.0.1:8270/?token=...
+```
+
+That address serves the record as JSON, and serves nothing else — there is no
+write endpoint. It is reachable only from this machine, only with the token in
+the URL, and only under a `Host` naming Tap's own port, because what it serves
+is the agent's entire context.
+
+Every request that reaches the proxy is in it, in wire order and from the
+moment it starts rather than when it finishes, typed `messages`,
+`count_tokens` or `other`, with the model, the provider's status, when it
+started and finished, how long it took, and the token and cache usage the
+provider reported. Requests Tap does not recognise are recorded by method and
+path rather than discarded.
+
+*Reaches the proxy* is the limit of what Tap can claim. Some of Claude Code's
+calls go to Anthropic whatever `ANTHROPIC_BASE_URL` says and never cross Tap
+at all; those are absent from the record, and no diagnostic marks them,
+because Tap has no way to know they happened. The record is everything the
+agent sent through Tap, not everything the agent sent.
+
+Capture never affects the agent. Response chunks are forwarded before capture
+is shown a copy of them, and a capture that fails — a body Tap cannot parse, a
+budget it cannot stay inside — becomes a **diagnostic** in the snapshot and
+nothing else. The agent's request is not delayed, altered or aborted by it.
+A request reports its first capture failure and not the ones after it, so one
+unreadable stream leaves one diagnostic rather than one per chunk.
+
+The browser page that renders all this is still to come, and with it the live
+stream that follows a snapshot: for now the JSON is the reader, and re-reading
+the URL is how you see what has happened since.
+
+Run several sessions at once by giving each its own UI port:
+
+```sh
+tap launch --port 8271 claude
+```
 
 ## Requirements
 
