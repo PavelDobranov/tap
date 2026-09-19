@@ -31,16 +31,23 @@ export class AgentNotFoundError extends Error {
 }
 
 /**
- * Runs an agent to completion on this terminal.
+ * Runs an agent to completion on this terminal, with `overrides` added to the
+ * environment it inherits — which is how the agent is pointed at Tap's proxy.
  *
  * Stdio is inherited, so the agent has the real terminal: colours, raw mode,
  * keyboard input and resize all work with no relaying and, decisively, no PTY
  * — a native dependency Tap has no use for. Tap writes nothing while the agent
  * runs, so its output can never interleave with the agent's.
  */
-export function runAgent(invocation: Invocation): Promise<AgentOutcome> {
+export function runAgent(
+  invocation: Invocation,
+  overrides: NodeJS.ProcessEnv = {},
+): Promise<AgentOutcome> {
   return new Promise<AgentOutcome>((resolve, reject) => {
-    const child = spawn(invocation.command, invocation.args, { stdio: "inherit" });
+    const child = spawn(invocation.command, invocation.args, {
+      stdio: "inherit",
+      env: { ...process.env, ...overrides },
+    });
 
     child.on("error", (error: NodeJS.ErrnoException) => {
       reject(

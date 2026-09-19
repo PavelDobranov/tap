@@ -34,6 +34,13 @@ _Avoid_: finished, closed, ended, stopped
 
 ### Interception
 
+**Proxy**:
+The HTTP server the agent's requests are pointed at, bound on an ephemeral
+port on the loopback address and in the path for the live phase of a Tap
+session only. It is transparent: what reaches the upstream is what the agent
+sent, and what reaches the agent is what the upstream sent, chunk for chunk.
+_Avoid_: interceptor, gateway, MITM, forwarder
+
 **Upstream**:
 Where Tap forwards requests: the base URL inherited from the environment if one
 is set, otherwise the default Anthropic API.

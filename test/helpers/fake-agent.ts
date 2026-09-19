@@ -54,3 +54,112 @@ export function createFakeAgent(body: string = INTERACTIVE_AGENT): FakeAgent {
     remove: () => rmSync(root, { recursive: true, force: true }),
   };
 }
+
+/**
+ * One request the probe agent makes. Defaults are a plausible `/v1/messages`
+ * POST, so a test only states the part it is asserting on.
+ */
+export interface ProbeStep {
+  readonly method?: string;
+  readonly path?: string;
+  readonly headers?: Readonly<Record<string, string>>;
+  readonly body?: string;
+}
+
+/** A chunk as the agent received it, timed from the arrival of the first one. */
+export interface ProbeChunk {
+  readonly atMs: number;
+  readonly text: string;
+}
+
+/** What one scripted request got back. */
+export interface ProbeResponse {
+  readonly status: number;
+  readonly headers: Record<string, string | string[]>;
+  readonly chunks: ProbeChunk[];
+  /** Every chunk joined: the response body as bytes. */
+  readonly body: string;
+  /** Set instead of the rest when the request itself failed. */
+  readonly error?: string;
+}
+
+/** The file the probe agent writes: the agent's side of the whole exchange. */
+export interface ProbeTranscript {
+  /** The base URL the agent was pointed at — Tap's proxy, in a real session. */
+  readonly baseUrl: string;
+  readonly responses: ProbeResponse[];
+}
+
+/**
+ * The assertion probe: an agent that issues scripted requests at whatever
+ * `ANTHROPIC_BASE_URL` names and writes down what came back, chunk by chunk
+ * and with arrival times. Streaming fidelity is asserted from this file, at
+ * the CLI seam, with no hook inside Tap.
+ *
+ * Reads `FAKE_AGENT_PROBE_SCRIPT` (a JSON array of steps) and writes
+ * `FAKE_AGENT_PROBE_FILE`, then exits — or, with `FAKE_AGENT_PROBE_STAY` set,
+ * waits for `exit` on stdin, so a test can inspect a session still running.
+ */
+export const PROBE_AGENT = `
+const { writeFileSync } = require("node:fs");
+const http = require("node:http");
+
+const base = new URL(process.env.ANTHROPIC_BASE_URL);
+const script = JSON.parse(process.env.FAKE_AGENT_PROBE_SCRIPT || "[{}]");
+const transcript = { baseUrl: base.toString(), responses: [] };
+
+function ask(step) {
+  return new Promise((resolve) => {
+    const path = step.path || "/v1/messages";
+    const body = step.body === undefined ? '{"model":"claude-opus-5"}' : step.body;
+    const request = http.request(
+      {
+        host: base.hostname,
+        port: base.port,
+        method: step.method || "POST",
+        path: base.pathname.replace(/\\/$/, "") + path,
+        headers: Object.assign(
+          { "content-type": "application/json", "content-length": Buffer.byteLength(body) },
+          step.headers || {},
+        ),
+      },
+      (response) => {
+        response.socket.setNoDelay(true);
+        const chunks = [];
+        let first;
+        response.on("data", (chunk) => {
+          const now = process.hrtime.bigint();
+          if (first === undefined) first = now;
+          chunks.push({ atMs: Number(now - first) / 1e6, text: chunk.toString("utf8") });
+        });
+        response.on("end", () => {
+          transcript.responses.push({
+            status: response.statusCode,
+            headers: response.headers,
+            chunks,
+            body: chunks.map((chunk) => chunk.text).join(""),
+          });
+          resolve();
+        });
+      },
+    );
+    request.on("socket", (socket) => socket.setNoDelay(true));
+    request.on("error", (error) => {
+      transcript.responses.push({ status: 0, headers: {}, chunks: [], body: "", error: String(error.message) });
+      resolve();
+    });
+    request.end(body);
+  });
+}
+
+(async () => {
+  for (const step of script) await ask(step);
+  writeFileSync(process.env.FAKE_AGENT_PROBE_FILE, JSON.stringify(transcript));
+  if (!process.env.FAKE_AGENT_PROBE_STAY) process.exit(Number(process.env.FAKE_AGENT_EXIT || "0"));
+  require("node:readline")
+    .createInterface({ input: process.stdin })
+    .on("line", (line) => {
+      if (line.trim() === "exit") process.exit(Number(process.env.FAKE_AGENT_EXIT || "0"));
+    });
+})();
+`;
