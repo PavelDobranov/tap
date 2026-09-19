@@ -1,5 +1,6 @@
 import {
   createBlobs,
+  type Blob,
   type BlobMap,
   type Eviction as BlobEviction,
   type PayloadStorage,
@@ -173,8 +174,20 @@ export interface Storage extends PayloadStorage {
   readonly cap: number;
 }
 
+export interface AgentExit {
+  readonly code: number | null;
+  readonly signal: NodeJS.Signals | null;
+}
+
+export type Lifecycle =
+  | { readonly phase: "live" }
+  | { readonly phase: "frozen"; readonly agent: AgentExit };
+
 /** The whole record as it stands. */
 export interface Snapshot {
+  /** Revision after the last change represented by this snapshot. */
+  readonly revision: number;
+  readonly lifecycle: Lifecycle;
   readonly requests: readonly RecordedRequest[];
   /**
    * The conversation lineages seen, in order of first appearance. The first is
@@ -206,6 +219,38 @@ export interface Snapshot {
  * the upstream, by the agent giving up, or by never being answered at all.
  */
 export type Ending = "closed" | "cut";
+
+/** Row-sized facts that can change after a request starts. */
+export interface RequestChange {
+  readonly thread?: number | null;
+  readonly model?: string | null;
+  readonly status?: number | null;
+  readonly completedAt?: string | null;
+  readonly durationMs?: number | null;
+  readonly usage?: Usage | null;
+  readonly interrupted?: boolean;
+}
+
+/** Small, bounded changes from which a live reader advances its snapshot. */
+export type RecordEvent =
+  | { readonly type: "request-start"; readonly request: RecordedRequest }
+  | { readonly type: "request-change"; readonly seq: number; readonly changes: RequestChange }
+  | { readonly type: "raw-response"; readonly seq: number; readonly event: string }
+  | { readonly type: "blob-added"; readonly hash: string; readonly blob: Blob }
+  | { readonly type: "blob-evicted"; readonly eviction: Eviction }
+  | { readonly type: "diagnostic"; readonly diagnostic: Diagnostic }
+  | { readonly type: "storage"; readonly storage: Storage }
+  | { readonly type: "frozen"; readonly agent: AgentExit };
+
+export interface RevisionedEvent {
+  readonly revision: number;
+  readonly event: RecordEvent;
+}
+
+export interface RecordView {
+  readonly snapshot: Snapshot;
+  close(): void;
+}
 
 /**
  * One request's place in the record, handed out when the request starts and
@@ -280,6 +325,9 @@ export interface Record {
    * its own.
    */
   diagnose(seq: number | null, detail: unknown): void;
+  /** Atomically takes a snapshot and follows every later revision. */
+  view(receive: (event: RevisionedEvent) => void): RecordView;
+  freeze(outcome: AgentExit): void;
   snapshot(): Snapshot;
 }
 
@@ -292,6 +340,25 @@ export function createRecord(options: RecordOptions = {}): Record {
   const threads = createThreads();
   /** Counted as events arrive, so a snapshot never re-measures the record. */
   let responseSize = 0;
+  let revision = 0;
+  let lifecycle: Lifecycle = { phase: "live" };
+  const viewers = new Set<(event: RevisionedEvent) => void>();
+
+  const publish = (event: RecordEvent): void => {
+    revision += 1;
+    const revisioned = { revision, event };
+    for (const receive of viewers) {
+      try {
+        receive(revisioned);
+      } catch {
+        // A disposable viewer is outside capture's failure boundary: it can
+        // lose itself, never the request whose change it was being shown.
+        viewers.delete(receive);
+      }
+    }
+  };
+
+  const storage = (): Storage => measure(blobs.storage(), responseSize, cap);
 
   /**
    * Brings the record back under its cap, if the last thing held took it
@@ -308,8 +375,10 @@ export function createRecord(options: RecordOptions = {}): Record {
     if (evicted.length === 0) return;
     const at = new Date().toISOString();
     for (const eviction of evicted) {
-      evictions.push({ ...eviction, at });
+      const recorded = { ...eviction, at };
+      evictions.push(recorded);
       if (evictions.length > EVICTION_EVENTS) evictions.shift();
+      publish({ type: "blob-evicted", eviction: recorded });
     }
   };
 
@@ -341,70 +410,108 @@ export function createRecord(options: RecordOptions = {}): Record {
         toolUses,
       };
       requests.push(request);
+      publish({ type: "request-start", request: copyRequest(request) });
 
-      const amend = (changes: Partial<RecordedRequest>): void => {
+      const amend = (
+        changes: Partial<RecordedRequest>,
+        visible: RequestChange | null,
+      ): void => {
         request = { ...request, ...changes };
         requests[seq - 1] = request;
+        if (visible !== null) publish({ type: "request-change", seq, changes: visible });
       };
 
       return {
         seq,
         type,
-        observeModel: (model) => amend({ model }),
+        observeModel: (model) => amend({ model }, { model }),
         observePayload: (payload) => {
           const stored = blobs.store(payload, type, seq);
           // Attributed from the payload that was held, so the prefix a thread
           // is derived from is the prefix the record can show.
-          amend({
-            skeleton: stored.skeleton,
-            thread: threads.attribute(seq, stored.messageAddresses),
-          });
+          for (const [hash, blob] of Object.entries(stored.additions)) {
+            publish({ type: "blob-added", hash, blob });
+          }
+          const thread = threads.attribute(seq, stored.messageAddresses);
+          amend({ skeleton: stored.skeleton, thread }, { thread });
           enforce();
+          publish({ type: "storage", storage: storage() });
         },
         observeRawResponse: (event) => {
           responseSize += Buffer.byteLength(event);
           rawResponse.push(event);
+          publish({ type: "raw-response", seq, event });
           enforce();
+          publish({ type: "storage", storage: storage() });
         },
-        observeStatus: (status) => amend({ status }),
+        observeStatus: (status) => amend({ status }, { status }),
         observeToolUse: (toolUse) => {
           // A `data:` line inside an event still open is read again on the
           // next pass, so the same block arrives more than once; the response
           // opened it once either way.
           if (toolUses.some((seen) => seen.id === toolUse.id)) return;
           toolUses.push(toolUse);
+          amend({ toolUses: [...toolUses] }, null);
         },
-        observeUsage: (usage) => amend({ usage: { ...request.usage, ...usage } }),
+        observeUsage: (usage) => {
+          const observed = { ...request.usage, ...usage };
+          amend({ usage: observed }, { usage: observed });
+        },
         complete: (ending) => {
           if (request.completedAt !== null) return;
-          amend({
+          const changes = {
             completedAt: new Date().toISOString(),
             durationMs: Math.round(performance.now() - started),
             interrupted: ending === "cut",
-          });
+          };
+          amend(changes, changes);
         },
       };
     },
 
     diagnose(seq, detail) {
-      diagnostics.push({ at: new Date().toISOString(), seq, detail: describe(detail) });
+      const diagnostic = { at: new Date().toISOString(), seq, detail: describe(detail) };
+      diagnostics.push(diagnostic);
+      publish({ type: "diagnostic", diagnostic });
+    },
+
+    view(receive) {
+      viewers.add(receive);
+      const initial = takeSnapshot();
+      return { snapshot: initial, close: () => viewers.delete(receive) };
+    },
+
+    freeze(outcome) {
+      if (lifecycle.phase === "frozen") return;
+      lifecycle = { phase: "frozen", agent: outcome };
+      publish({ type: "frozen", agent: outcome });
     },
 
     // Copied down to the raw events, because a snapshot is the record as it
     // stands: an array still being appended to is a later record than the one
     // its reader was handed.
-    snapshot: () => ({
-      requests: requests.map((request) => ({
-        ...request,
-        rawResponse: [...request.rawResponse],
-        toolUses: [...request.toolUses],
-      })),
+    snapshot: () => takeSnapshot(),
+  };
+
+  function takeSnapshot(): Snapshot {
+    return {
+      revision,
+      lifecycle,
+      requests: requests.map(copyRequest),
       threads: threads.list(),
       blobs: blobs.map(),
-      storage: measure(blobs.storage(), responseSize, cap),
+      storage: storage(),
       evictions: [...evictions],
       diagnostics: [...diagnostics],
-    }),
+    };
+  }
+}
+
+function copyRequest(request: RecordedRequest): RecordedRequest {
+  return {
+    ...request,
+    rawResponse: [...request.rawResponse],
+    toolUses: [...request.toolUses],
   };
 }
 

@@ -27,10 +27,11 @@ session at:
 tap: inspect this session at http://127.0.0.1:8270/?token=...
 ```
 
-That address serves the record as JSON, and serves nothing else — there is no
-write endpoint. It is reachable only from this machine, only with the token in
-the URL, and only under a `Host` naming Tap's own port, because what it serves
-is the agent's entire context.
+That address opens the live request list. It is reachable only from this
+machine, only with the token in the URL, and only under a `Host` naming Tap's
+own port, because what it serves is the agent's entire context. The UI is local
+HTML, CSS and browser-native JavaScript; it loads no remote code. An
+authenticated JSON snapshot remains available at `/api/snapshot`.
 
 Every request that reaches the proxy is in it, in wire order and from the
 moment it starts rather than when it finishes, typed `messages`,
@@ -120,9 +121,12 @@ nothing else. The agent's request is not delayed, altered or aborted by it.
 A request reports its first capture failure and not the ones after it, so one
 unreadable stream leaves one diagnostic rather than one per chunk.
 
-The browser page that renders all this is still to come, and with it the live
-stream that follows a snapshot: for now the JSON is the reader, and re-reading
-the URL is how you see what has happened since.
+The browser receives one authoritative snapshot and then live, ordered changes
+on the same event stream. A request therefore appears when it starts and its
+row advances through response activity and completion without a refresh.
+Opening late or reconnecting starts again from a fresh snapshot, and a viewer
+that falls behind is disconnected rather than being allowed to delay capture
+or the agent.
 
 Run several sessions at once by giving each its own UI port, and move the
 record's ceiling with `--record-cap`, which takes bytes or a size:

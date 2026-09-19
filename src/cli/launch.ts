@@ -109,6 +109,7 @@ export async function launch(argv: readonly string[], io: Io): Promise<number> {
     await proxy.close();
   }
 
+  record.freeze(outcome);
   io.stderr.write(
     `tap: ${describeOutcome(invocation.command, outcome)}\n` +
       `tap: session frozen; press Ctrl+C to exit tap\n`,

@@ -100,6 +100,10 @@ export interface SnapshotThread {
 }
 
 export interface Snapshot {
+  revision: number;
+  lifecycle:
+    | { phase: "live" }
+    | { phase: "frozen"; agent: { code: number | null; signal: NodeJS.Signals | null } };
   requests: SnapshotRequest[];
   threads: SnapshotThread[];
   blobs: { [hash: string]: SnapshotBlob };
@@ -187,7 +191,7 @@ export function printedUrl(output: string): string | undefined {
 /** Reads the snapshot from a printed UI URL. */
 export async function snapshotAt(url: string): Promise<Snapshot> {
   const parsed = new URL(url);
-  const answer = await ask(Number(parsed.port), `${parsed.pathname}${parsed.search}`, {
+  const answer = await ask(Number(parsed.port), `/api/snapshot${parsed.search}`, {
     headers: { host: parsed.host },
   });
   if (answer.status !== 200) throw new Error(`snapshot refused with ${answer.status}`);

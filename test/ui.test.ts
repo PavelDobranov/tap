@@ -3,6 +3,7 @@ import { createServer, request as httpRequest } from "node:http";
 import { connect } from "node:net";
 import { networkInterfaces } from "node:os";
 import { performance } from "node:perf_hooks";
+import { runInNewContext } from "node:vm";
 import { after, test } from "node:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -89,6 +90,67 @@ function largeRecord(): ReturnType<typeof createRecord> {
   return record;
 }
 
+interface SseMessage {
+  readonly event: string;
+  readonly id: number;
+  readonly data: unknown;
+}
+
+interface SseViewer {
+  next(): Promise<SseMessage>;
+  close(): void;
+}
+
+/** Opens the browser's live HTTP seam and reads one framed event at a time. */
+function openEvents(url: string): Promise<SseViewer> {
+  const target = new URL(url);
+  target.pathname = "/api/events";
+  return new Promise((resolve, reject) => {
+    const req = httpRequest(target, { headers: { accept: "text/event-stream" } });
+    req.once("error", reject);
+    req.once("response", (response) => {
+      assert.equal(response.statusCode, 200);
+      response.setEncoding("utf8");
+      let buffered = "";
+      const messages: SseMessage[] = [];
+      const waiting: ((message: SseMessage) => void)[] = [];
+      response.on("data", (chunk: string) => {
+        buffered += chunk;
+        for (;;) {
+          const boundary = buffered.indexOf("\n\n");
+          if (boundary < 0) break;
+          const frame = buffered.slice(0, boundary);
+          buffered = buffered.slice(boundary + 2);
+          const fields = Object.fromEntries(
+            frame.split("\n").map((line) => {
+              const colon = line.indexOf(":");
+              return [line.slice(0, colon), line.slice(colon + 1).trimStart()];
+            }),
+          );
+          const message = {
+            event: fields.event ?? "message",
+            id: Number(fields.id),
+            data: JSON.parse(fields.data ?? "null") as unknown,
+          };
+          const receive = waiting.shift();
+          if (receive === undefined) messages.push(message);
+          else receive(message);
+        }
+      });
+      resolve({
+        next: () =>
+          new Promise((receive) => {
+            const message = messages.shift();
+            if (message === undefined) waiting.push(receive);
+            else receive(message);
+          }),
+        close: () => req.destroy(),
+      });
+    });
+    req.end();
+  });
+}
+
 interface ProxiedStream {
   readonly firstChunk: Promise<void>;
   readonly gaps: Promise<number[]>;
@@ -152,18 +214,210 @@ function readThroughProxy(baseUrl: string): ProxiedStream {
   return { firstChunk: first, gaps };
 }
 
-test("the UI is served on its own loopback port, given by --port", async () => {
+test("the printed URL serves the local request list with hardened browser headers", async () => {
   const { session, url } = await inspectable();
+  const page = await ask(Number(url.port), `${url.pathname}${url.search}`, {
+    headers: { host: url.host },
+  });
 
   assert.equal(url.protocol, "http:");
   assert.equal(url.hostname, "127.0.0.1");
+  assert.equal(page.status, 200);
+  assert.match(String(page.headers["content-type"]), /^text\/html/);
+  assert.match(page.body, /<th[^>]*>Sequence<\/th>/);
+  assert.match(page.body, /<th[^>]*>Tokens \/ cache<\/th>/);
+  assert.doesNotMatch(page.body, new RegExp(url.searchParams.get("token")!));
+  assert.equal(page.headers["referrer-policy"], "no-referrer");
+  assert.equal(page.headers["x-content-type-options"], "nosniff");
+  assert.equal(page.headers["cache-control"], "no-store");
+  assert.match(String(page.headers["content-security-policy"]), /default-src 'self'/);
+
   const snapshot = await snapshotAt(url.href);
   assert.deepEqual(snapshot.requests, []);
-  assert.deepEqual(snapshot.diagnostics, []);
+  assert.equal(snapshot.lifecycle.phase, "live");
 
   session.type("exit 0");
   await quit(session);
 });
+
+
+test("the browser script renders snapshot rows and applies later request changes", async (t) => {
+  const record = createRecord();
+  const ui = await startUi(record, await freePort());
+  t.after(() => ui.close());
+  const url = new URL(ui.url);
+  const script = await ask(Number(url.port), `/app.js${url.search}`, { headers: { host: url.host } });
+
+  class Element {
+    readonly children: Element[] = [];
+    readonly dataset: { [name: string]: string } = {};
+    textContent = "";
+    hidden = false;
+    append(child: Element): void { this.children.push(child); }
+    insertBefore(child: Element, before: Element | null): void {
+      const at = before === null ? -1 : this.children.indexOf(before);
+      if (at < 0) this.children.push(child);
+      else this.children.splice(at, 0, child);
+    }
+    replaceChildren(): void { this.children.length = 0; }
+  }
+  const requests = new Element();
+  const elements: { [selector: string]: Element } = {
+    "#requests": requests,
+    "#empty": new Element(),
+    "#connection": new Element(),
+    "#lifecycle": new Element(),
+  };
+  const page = new Element();
+  let source!: {
+    listeners: { [event: string]: (message: { data: string }) => void };
+  };
+  class EventSource {
+    readonly listeners: { [event: string]: (message: { data: string }) => void } = {};
+    constructor(_target: string) { source = this; }
+    addEventListener(event: string, receive: (message: { data: string }) => void): void {
+      this.listeners[event] = receive;
+    }
+  }
+  runInNewContext(script.body, {
+    URL,
+    location: { href: ui.url },
+    EventSource,
+    document: {
+      body: page,
+      querySelector: (selector: string) => elements[selector],
+      createElement: () => new Element(),
+    },
+  });
+
+  const request = {
+    seq: 1, type: "messages", thread: 1, model: "claude-live", status: null,
+    startedAt: "2025-01-01T12:00:00.000Z", completedAt: null, durationMs: null,
+    usage: null, rawResponse: [], interrupted: false,
+  };
+  source.listeners.snapshot!({
+    data: JSON.stringify({ snapshot: { requests: [request], lifecycle: { phase: "live" } } }),
+  });
+  assert.equal(requests.children.length, 1);
+  assert.deepEqual(requests.children[0]!.children.slice(0, 5).map(({ textContent }) => textContent),
+    ["1", "messages", "main", "claude-live", "in flight"]);
+
+  source.listeners.delta!({
+    data: JSON.stringify({ type: "request-change", seq: 1, changes: {
+      status: 200, completedAt: "2025-01-01T12:00:01.000Z", durationMs: 1000,
+      usage: { inputTokens: 12, outputTokens: 3 },
+    } }),
+  });
+  const cells = requests.children[0]!.children;
+  assert.equal(cells[4]!.textContent, "200");
+  assert.equal(cells[6]!.textContent, "1000 ms");
+  assert.equal(cells[7]!.textContent, "in 12 · out 3");
+});
+
+
+test("each live connection starts with a snapshot then receives ordered request deltas", async () => {
+  const record = createRecord({ cap: 1 });
+  const ui = await startUi(record, await freePort());
+  const first = await openEvents(ui.url);
+  const second = await openEvents(ui.url);
+
+  try {
+    const a = await first.next();
+    const b = await second.next();
+    assert.equal(a.event, "snapshot");
+    assert.equal(b.event, "snapshot");
+    assert.equal(a.id, 0);
+
+    const entry = record.begin("POST", "/v1/messages");
+    entry.observePayload('{"model":"claude-live","messages":[{"role":"user","content":"hello"}]}');
+    entry.observeStatus(200);
+    entry.observeRawResponse("data: hello\n\n");
+    entry.complete("closed");
+
+    const events: SseMessage[] = [];
+    while (!events.some(({ data }) => (data as { type?: string }).type === "request-change" &&
+      (data as { changes?: { completedAt?: string | null } }).changes?.completedAt != null)) {
+      events.push(await first.next());
+    }
+    assert.ok(events.every(({ event }) => event === "delta"));
+    assert.deepEqual(events.map(({ id }) => id), events.map(({ id }) => id).toSorted((x, y) => x - y));
+    assert.ok(events.some(({ data }) => (data as { type?: string }).type === "request-start"));
+    assert.ok(events.some(({ data }) => (data as { type?: string }).type === "raw-response"));
+    assert.ok(events.some(({ data }) => (data as { type?: string }).type === "blob-added"));
+    assert.ok(events.some(({ data }) => (data as { type?: string }).type === "blob-evicted"));
+    assert.ok(events.some(({ data }) => (data as { type?: string }).type === "storage"));
+
+    record.diagnose(entry.seq, "capture failed visibly");
+    record.freeze({ code: null, signal: "SIGTERM" });
+    while (!events.some(({ data }) => (data as { type?: string }).type === "frozen")) {
+      events.push(await first.next());
+    }
+    assert.ok(events.some(({ data }) => (data as { type?: string }).type === "diagnostic"));
+    const frozen = events.find(({ data }) => (data as { type?: string }).type === "frozen")!;
+    assert.deepEqual((frozen.data as { agent: unknown }).agent, { code: null, signal: "SIGTERM" });
+
+    const sameStart = await second.next();
+    assert.equal((sameStart.data as { type?: string }).type, "request-start");
+    first.close();
+    const reconnected = await openEvents(ui.url);
+    const fresh = await reconnected.next();
+    assert.equal(fresh.event, "snapshot");
+    assert.equal((fresh.data as { snapshot: { requests: unknown[] } }).snapshot.requests.length, 1);
+    reconnected.close();
+  } finally {
+    first.close();
+    second.close();
+    await ui.close();
+  }
+});
+
+test("a viewer under backpressure is disposable and a later viewer gets a fresh snapshot", async () => {
+  const record = createRecord();
+  const ui = await startUi(record, await freePort());
+  const target = new URL(ui.url);
+  target.pathname = "/api/events";
+  const call = httpRequest(target);
+  const response = await new Promise<import("node:http").IncomingMessage>((resolve, reject) => {
+    call.once("response", resolve);
+    call.once("error", reject);
+    call.end();
+  });
+  await new Promise<void>((resolve) => response.once("data", () => resolve()));
+  // The opening snapshot is now on the wire; only later deltas exercise the
+  // no-buffer backpressure rule.
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  response.pause();
+
+  const closed = new Promise<void>((resolve) => response.once("close", () => resolve()));
+  const entry = record.begin("POST", "/v1/messages");
+  const beforeCapture = performance.now();
+  entry.observeRawResponse("x".repeat(64 * 1024));
+  const captureDelay = performance.now() - beforeCapture;
+  assert.ok(captureDelay < 125, `stalled viewer delayed capture by ${captureDelay.toFixed(1)}ms`);
+  response.resume();
+  await Promise.race([
+    closed,
+    new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error("stalled viewer stayed connected")), 2_000),
+    ),
+  ]);
+
+  const reconnected = await openEvents(ui.url);
+  try {
+    const initial = await reconnected.next();
+    assert.equal(initial.event, "snapshot");
+    assert.equal((initial.data as { snapshot: { requests: unknown[] } }).snapshot.requests.length, 1);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    record.begin("GET", "/later");
+    assert.equal(((await reconnected.next()).data as { type: string }).type, "request-start");
+  } finally {
+    reconnected.close();
+    call.destroy();
+    await new Promise((resolve) => setImmediate(resolve));
+    await ui.close();
+  }
+});
+
 
 test("serving a large snapshot yields often enough for forwarding to keep running", async () => {
   const record = largeRecord();
@@ -289,7 +543,7 @@ test("a request with an unexpected Host header is refused", async () => {
   await quit(session);
 });
 
-test("the UI serves a snapshot and nothing else: no write endpoint exists", async () => {
+test("the UI routes are read-only", async () => {
   const { session, url } = await inspectable();
   const port = Number(url.port);
   const target = `/?token=${url.searchParams.get("token")}`;
@@ -335,6 +589,7 @@ test("the snapshot is still served, unchanged, once the agent has exited", async
 
   const frozen = await snapshotAt(url.href);
   assert.deepEqual(frozen.requests, []);
+  assert.deepEqual(frozen.lifecycle, { phase: "frozen", agent: { code: 0, signal: null } });
 
   session.interrupt();
   await session.exited;

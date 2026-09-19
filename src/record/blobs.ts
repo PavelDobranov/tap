@@ -76,6 +76,8 @@ export interface BlobMap {
  */
 export interface Stored {
   readonly skeleton: Skeleton;
+  /** Blobs first introduced by this payload, for live readers. */
+  readonly additions: BlobMap;
   /**
    * One address per element of `messages[]`, in order. Empty for a payload
    * with no messages in it — an `other` request, a `count_tokens` with none,
@@ -157,6 +159,8 @@ export function createBlobs(): Blobs {
   let referencedUnits = 0;
   let evictedBlobs = 0;
   let evictedBytes = 0;
+  /** Set only for the duration of one synchronous store operation. */
+  let additions: { [hash: string]: Blob } = {};
 
   /**
    * Holds one unit, and hands back its address and, where it could be held as
@@ -190,6 +194,7 @@ export function createBlobs(): Blobs {
     if (held === undefined) {
       const detached = detach(json);
       blobs.set(hash, { json: detached.text, size: detached.size, lastSeq: seq, references: 1 });
+      additions[hash] = { json: detached.text, size: detached.size };
       blobBytes += detached.size;
     } else if (held.json !== json) {
       // Two spellings of one content: canonical JSON says they are the same
@@ -211,11 +216,12 @@ export function createBlobs(): Blobs {
 
   return {
     store(payload, type, seq) {
+      additions = {};
       const located = type === "other" ? null : locate(payload);
       if (located === null) {
         // Already its own string, so there is nothing to detach it from.
         literalBytes += Buffer.byteLength(payload);
-        return { skeleton: [payload], messageAddresses: [] };
+        return { skeleton: [payload], messageAddresses: [], additions };
       }
 
       const messageAddresses: string[] = [];
@@ -248,7 +254,7 @@ export function createBlobs(): Blobs {
 
       literal += payload.slice(cursor);
       flush();
-      return { skeleton: parts, messageAddresses };
+      return { skeleton: parts, messageAddresses, additions };
     },
 
     map: () =>
