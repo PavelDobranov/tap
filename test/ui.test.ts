@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
-import { createServer } from "node:http";
+import { createServer, request as httpRequest } from "node:http";
 import { connect } from "node:net";
 import { networkInterfaces } from "node:os";
+import { performance } from "node:perf_hooks";
 import { after, test } from "node:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -10,6 +11,11 @@ import { createFakeAgent } from "./helpers/fake-agent.ts";
 import { freePort, killAllSessions, startTap, type TapSession } from "./helpers/run-tap.ts";
 import { quit } from "./helpers/session.ts";
 import { ask, printedUrl, snapshotAt } from "./helpers/snapshot.ts";
+import { createCapture } from "../src/record/capture.ts";
+import { createRecord } from "../src/record/record.ts";
+import { startProxy } from "../src/proxy/proxy.ts";
+import { startUi } from "../src/ui/server.ts";
+import { startFakeUpstream } from "./helpers/fake-upstream.ts";
 
 const agent = createFakeAgent();
 after(() => agent.remove());
@@ -65,6 +71,87 @@ function reachable(host: string, port: number): Promise<boolean> {
   });
 }
 
+/** A record large enough to show whether snapshot serving monopolises the event loop. */
+function largeRecord(): ReturnType<typeof createRecord> {
+  const record = createRecord({ cap: 128 * 1024 * 1024 });
+  const rawEvent = `data: ${"r".repeat(64 * 1024)}\n\n`;
+
+  for (let seq = 1; seq <= 400; seq += 1) {
+    const unique = `${seq}: ${"p".repeat(64 * 1024)}`;
+    const entry = record.begin("POST", "/v1/messages");
+    entry.observePayload(
+      JSON.stringify({ model: "claude-test", messages: [{ role: "user", content: unique }] }),
+    );
+    entry.observeRawResponse(rawEvent);
+    entry.complete("closed");
+  }
+
+  return record;
+}
+
+interface ProxiedStream {
+  readonly firstChunk: Promise<void>;
+  readonly gaps: Promise<number[]>;
+}
+
+function readThroughProxy(baseUrl: string): ProxiedStream {
+  const target = new URL("/v1/messages", baseUrl);
+  const body = JSON.stringify({
+    model: "claude-test",
+    messages: [{ role: "user", content: "hi" }],
+  });
+
+  let sawFirst = false;
+  let firstChunk!: () => void;
+  let failedFirst!: (error: Error) => void;
+  const first = new Promise<void>((resolve, reject) => {
+    firstChunk = resolve;
+    failedFirst = reject;
+  });
+
+  const gaps = new Promise<number[]>((resolve, reject) => {
+    const req = httpRequest(
+      target,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "content-length": String(Buffer.byteLength(body)),
+        },
+      },
+      (response) => {
+        const measured: number[] = [];
+        let last: number | null = null;
+        const fail = (error: Error) => {
+          if (!sawFirst) failedFirst(error);
+          reject(error);
+        };
+        response.on("data", () => {
+          const now = performance.now();
+          if (last !== null) measured.push(now - last);
+          last = now;
+          if (!sawFirst) {
+            sawFirst = true;
+            firstChunk();
+          }
+        });
+        response.on("end", () => {
+          if (!sawFirst) failedFirst(new Error("upstream stream ended without a chunk"));
+          resolve(measured);
+        });
+        response.on("error", fail);
+      },
+    );
+    req.on("error", (error) => {
+      if (!sawFirst) failedFirst(error);
+      reject(error);
+    });
+    req.end(body);
+  });
+
+  return { firstChunk: first, gaps };
+}
+
 test("the UI is served on its own loopback port, given by --port", async () => {
   const { session, url } = await inspectable();
 
@@ -76,6 +163,41 @@ test("the UI is served on its own loopback port, given by --port", async () => {
 
   session.type("exit 0");
   await quit(session);
+});
+
+test("serving a large snapshot yields often enough for forwarding to keep running", async () => {
+  const record = largeRecord();
+  const ui = await startUi(record, await freePort());
+  const upstream = await startFakeUpstream({
+    stream: {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+      chunks: [
+        { gapMs: 0, text: "data: first\n\n" },
+        { gapMs: 50, text: "data: second\n\n" },
+        { gapMs: 50, text: "data: third\n\n" },
+      ],
+    },
+  });
+  const proxy = await startProxy(new URL(upstream.baseUrl), createCapture(record));
+
+  try {
+    const streamed = readThroughProxy(proxy.baseUrl);
+    await streamed.firstChunk;
+    const snapshot = snapshotAt(ui.url);
+    const gaps = await streamed.gaps;
+
+    assert.ok((await snapshot).requests.length >= 400);
+    assert.ok(gaps.length >= 2, "the agent should receive the upstream response as chunks");
+    assert.ok(
+      gaps[0]! < 125,
+      `serving the snapshot delayed the next forwarded chunk by ${gaps[0]!.toFixed(1)}ms`,
+    );
+  } finally {
+    await proxy.close();
+    await upstream.close();
+    await ui.close();
+  }
 });
 
 test("the UI port is fixed by default and separate from the proxy's", async () => {

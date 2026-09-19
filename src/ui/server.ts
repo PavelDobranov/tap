@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { randomBytes, timingSafeEqual } from "node:crypto";
-import type { Record } from "../record/record.ts";
+import type { Record, Snapshot } from "../record/record.ts";
 
 /** The address Tap binds. Never a wildcard: this port serves the whole context. */
 const LOOPBACK = "127.0.0.1";
@@ -48,7 +48,16 @@ export class PortInUseError extends Error {
  */
 export async function startUi(record: Record, port: number): Promise<Ui> {
   const served: Served = { record, token: randomBytes(24).toString("base64url"), port };
-  const server = createServer((req, res) => answer(req, res, served));
+  const server = createServer((req, res) => {
+    void answer(req, res, served).catch((error: unknown) => {
+      if (error instanceof ResponseClosed || res.destroyed || res.writableEnded) return;
+      if (!res.headersSent) {
+        refuse(res, 500, "internal error");
+        return;
+      }
+      res.destroy(error instanceof Error ? error : undefined);
+    });
+  });
 
   await new Promise<void>((resolve, reject) => {
     server.once("error", (error: NodeJS.ErrnoException) => {
@@ -77,30 +86,49 @@ interface Served {
   readonly port: number;
 }
 
-function answer(req: IncomingMessage, res: ServerResponse, served: Served): void {
+async function answer(req: IncomingMessage, res: ServerResponse, served: Served): Promise<void> {
   const target = new URL(req.url ?? "/", `http://${LOOPBACK}:${served.port}`);
 
   if (!addressesThisMachine(req.headers.host, served.port)) {
-    return refuse(res, 403, "bad host");
+    refuse(res, 403, "bad host");
+    return;
   }
   if (!presented(target.searchParams.get("token"), served.token)) {
-    return refuse(res, 403, "bad token");
+    refuse(res, 403, "bad token");
+    return;
   }
-  if (target.pathname !== "/") return refuse(res, 404, "not found");
+  if (target.pathname !== "/") {
+    refuse(res, 404, "not found");
+    return;
+  }
   if (req.method !== "GET" && req.method !== "HEAD") {
     // Nothing here writes, so nothing here accepts a method that would.
-    return refuse(res, 405, "read only");
+    refuse(res, 405, "read only");
+    return;
   }
 
-  const body = JSON.stringify(served.record.snapshot());
-  res.writeHead(200, {
+  if (req.method === "HEAD") {
+    res.writeHead(200, snapshotHeaders());
+    res.end();
+    return;
+  }
+
+  // Taken once, before streaming starts, because a snapshot is the record as
+  // it stood when the viewer connected rather than a moving read of a record
+  // that may still be growing underneath the response.
+  const snapshot = served.record.snapshot();
+  res.writeHead(200, snapshotHeaders());
+  await writeSnapshot(res, snapshot);
+  res.end();
+}
+
+function snapshotHeaders(): { readonly [header: string]: string } {
+  return {
     "content-type": "application/json",
-    "content-length": String(Buffer.byteLength(body)),
     // The record never leaves the process: no store, no cache, no history
     // entry a later reader could find.
     "cache-control": "no-store",
-  });
-  res.end(req.method === "HEAD" ? undefined : body);
+  };
 }
 
 /** A refusal says only that it refused: never why, and never the token. */
@@ -108,6 +136,79 @@ function refuse(res: ServerResponse, status: number, reason: string): void {
   res.writeHead(status, { "content-type": "text/plain" });
   res.end(`tap: ${reason}\n`);
 }
+
+/** Streams a snapshot in record-order pieces, yielding between unbounded lists. */
+async function writeSnapshot(res: ServerResponse, snapshot: Snapshot): Promise<void> {
+  await writeChunk(res, '{"requests":');
+  await writeArray(res, snapshot.requests);
+  await writeChunk(res, ',"threads":');
+  await writeArray(res, snapshot.threads);
+  await writeChunk(res, ',"blobs":');
+  await writeBlobMap(res, snapshot.blobs);
+  await writeChunk(res, ',"storage":');
+  await writeChunk(res, JSON.stringify(snapshot.storage));
+  await writeChunk(res, ',"evictions":');
+  await writeArray(res, snapshot.evictions);
+  await writeChunk(res, ',"diagnostics":');
+  await writeArray(res, snapshot.diagnostics);
+  await writeChunk(res, "}");
+}
+
+async function writeArray(res: ServerResponse, values: readonly unknown[]): Promise<void> {
+  await writeChunk(res, "[");
+  for (const [index, value] of values.entries()) {
+    if (index > 0) await writeChunk(res, ",");
+    await writeChunk(res, JSON.stringify(value));
+    await yieldToOtherRequests();
+  }
+  await writeChunk(res, "]");
+}
+
+async function writeBlobMap(res: ServerResponse, blobs: Snapshot["blobs"]): Promise<void> {
+  await writeChunk(res, "{");
+  let first = true;
+  for (const [hash, blob] of Object.entries(blobs)) {
+    if (!first) await writeChunk(res, ",");
+    first = false;
+    await writeChunk(res, `${JSON.stringify(hash)}:${JSON.stringify(blob)}`);
+    await yieldToOtherRequests();
+  }
+  await writeChunk(res, "}");
+}
+
+function yieldToOtherRequests(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
+async function writeChunk(res: ServerResponse, chunk: string): Promise<void> {
+  if (res.destroyed || res.writableEnded) throw new ResponseClosed();
+  if (res.write(chunk)) return;
+
+  await new Promise<void>((resolve, reject) => {
+    const cleanup = () => {
+      res.off("drain", drained);
+      res.off("close", closed);
+      res.off("error", failed);
+    };
+    const drained = () => {
+      cleanup();
+      resolve();
+    };
+    const closed = () => {
+      cleanup();
+      reject(new ResponseClosed());
+    };
+    const failed = (error: Error) => {
+      cleanup();
+      reject(error);
+    };
+    res.once("drain", drained);
+    res.once("close", closed);
+    res.once("error", failed);
+  });
+}
+
+class ResponseClosed extends Error {}
 
 /**
  * Whether a `Host` header names Tap's own UI. Anything else is a request that
