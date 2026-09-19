@@ -1,3 +1,4 @@
+import { launch } from "./launch.ts";
 import type { Io } from "./io.ts";
 
 /** Runs a command with its own argv (everything after the command name). */
@@ -22,6 +23,7 @@ export const COMMANDS: readonly Command[] = [
     name: "launch",
     synopsis: "launch [claude] [...agent args]",
     summary: "Run an agent and inspect its provider traffic live",
+    run: launch,
   },
 ];
 

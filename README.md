@@ -8,7 +8,17 @@ Nothing is written to disk. The record lives in memory for the life of the
 session: when Tap exits, it is gone. That is what makes Tap safe to leave
 switched on in a repository full of secrets.
 
-`tap launch` is not implemented yet; the CLI reports as much.
+`tap launch claude` — or just `tap launch` — runs Claude Code on your terminal
+as it always runs: Tap inherits the terminal rather than emulating one, so
+colours, keyboard input and Ctrl+C behave identically, and Tap says nothing
+while the agent is running. Arguments are forwarded untouched, so
+`tap launch claude --model opus --resume` works.
+
+Recording is bound to the agent's life; Tap is not. When the agent exits the
+session is frozen — nothing more is captured, and Tap stays up so the record
+remains readable — until you interrupt it.
+
+Capture itself is not implemented yet.
 
 ## Requirements
 

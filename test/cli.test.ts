@@ -50,8 +50,8 @@ test("an unrecognised flag exits nonzero with a clear message", async () => {
 });
 
 // Commands whose milestone has not arrived yet; each one moves out of this
-// list as it is implemented.
-const unimplemented = commands;
+// list as it is implemented. `launch` behaviour lives in launch.test.ts.
+const unimplemented: string[] = [];
 
 for (const command of unimplemented) {
   test(`${command} is recognised and reports that it is not implemented yet`, async () => {
