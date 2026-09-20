@@ -16,8 +16,9 @@ export interface LaunchOptions {
   readonly rest: readonly string[];
 }
 
-const PORT = "--port";
-const RECORD_CAP = "--record-cap";
+/** The spellings, exported so the usage screen names what the parser reads. */
+export const PORT = "--port";
+export const RECORD_CAP = "--record-cap";
 
 /**
  * Reads Tap's own options off the front of `launch`'s arguments.

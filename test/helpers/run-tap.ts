@@ -110,6 +110,21 @@ export function runTap(
   return run(fileURLToPath(new URL("dist/cli.js", repoRoot)), args, options);
 }
 
+/**
+ * The same `tap`, started from its TypeScript sources rather than from `dist`.
+ *
+ * Still the executable seam — a spawned process, asserted on through its own
+ * output — and it exists for the one thing the built tree cannot show: that
+ * what Tap reads out of its package at runtime is found from both depths it is
+ * ever run at. A path correct only in `dist` would pass every other test here.
+ */
+export function runTapFromSource(
+  args: string[],
+  options: { cwd?: string; env?: NodeJS.ProcessEnv } = {},
+): Promise<RunResult> {
+  return run(process.execPath, [fileURLToPath(new URL("src/cli.ts", repoRoot)), ...args], options);
+}
+
 export function readManifest(): {
   bin: Record<string, string>;
   name: string;
