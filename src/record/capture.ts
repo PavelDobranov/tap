@@ -10,8 +10,11 @@ import { readModel, readResponseModel, readSse, readToolUses, readUsage } from "
  * these and never waits for them: they exist so that capture can watch the
  * bytes going past, not so that it can stand in their way.
  *
- * Every method is total. A capture step that fails becomes a diagnostic in
- * here rather than an exception the proxy has to think about.
+ * Every method is total, and this is where fail-open is kept: a capture step
+ * that fails becomes a diagnostic in here rather than an exception the proxy
+ * has to think about. Nothing on the request path guards these calls, because
+ * a promise made on both sides of a seam is a promise neither side can be
+ * read for. Its floor is `Record.diagnose`, which is total in turn.
  */
 export interface RequestCapture {
   requestChunk(chunk: Buffer): void;
@@ -170,10 +173,13 @@ function watchRequest(record: Record, entry: Entry): RequestCapture {
         response = null;
         requestBody = null;
       });
-      // Outside the attempt: the request is over whether or not capture could
-      // make sense of it, and a record that forgot to close an entry would
-      // show an answered request as still in flight.
-      entry.complete(ending);
+      // Attempted separately, not inside the one above: the request is over
+      // whether or not capture could make sense of it, and a record that
+      // forgot to close an entry would show an answered request as still in
+      // flight. It is still attempted, because nothing capture does may leave
+      // by throwing — the proxy calls this from the response path and has no
+      // guard of its own.
+      attempt(() => entry.complete(ending));
     },
   };
 }

@@ -1,7 +1,7 @@
 import { createServer, request as httpRequest, type IncomingMessage, type ServerResponse } from "node:http";
 import { request as httpsRequest } from "node:https";
 import type { Socket } from "node:net";
-import type { Capture, RequestCapture } from "../record/capture.ts";
+import type { Capture } from "../record/capture.ts";
 
 /**
  * Headers that describe one hop of a connection rather than the message, and
@@ -40,11 +40,10 @@ export interface Proxy {
  * a streamed response reaches the agent in the chunks and with the pauses the
  * upstream produced. Nothing is buffered, decoded or rewritten.
  *
- * `capture` watches what goes past and is never in the way of it. Every call
- * into it is wrapped, so a capture that throws becomes a diagnostic and the
- * agent's request carries on as if capture were not installed; and every call
- * is made *after* the bytes have been handed on, so no capture work is ever
- * awaited before a response chunk is forwarded.
+ * `capture` watches what goes past and is never in the way of it. That is
+ * capture's promise to keep and is written down there; all this file owes it
+ * is the order — every call is made *after* the bytes have been handed on, so
+ * no capture work is ever awaited before a response chunk is forwarded.
  */
 export async function startProxy(upstream: URL, capture: Capture): Promise<Proxy> {
   const server = createServer((req, res) => forward(req, res, upstream, capture));
@@ -90,7 +89,7 @@ function forward(
   const send = upstream.protocol === "https:" ? httpsRequest : httpRequest;
   const prefix = upstream.pathname.replace(/\/$/, "");
 
-  const captured = watch(capture, req);
+  const captured = capture.begin(req.method ?? "", req.url ?? "");
 
   const outbound = send({
     protocol: upstream.protocol,
@@ -154,37 +153,6 @@ function forward(
   req.on("data", (chunk: Buffer) => captured.requestChunk(chunk));
   req.on("end", () => captured.requestEnd());
   req.on("error", () => outbound.destroy());
-}
-
-/**
- * Opens capture for one request, behind a barrier nothing can throw through.
- *
- * Capture writes its own failures down as diagnostics, so there is nothing
- * left for this to report: it exists only so that an exception escaping
- * capture cannot escape into the agent's request. An invariant that depends on
- * every call site remembering to wrap itself is not an invariant, so no
- * unwrapped handle is handed out.
- */
-function watch(capture: Capture, req: IncomingMessage): RequestCapture {
-  const opened = capture.begin(req.method ?? "", req.url ?? "");
-
-  const guarded = (step: () => void): void => {
-    try {
-      step();
-    } catch {
-      // Deliberately silent, and deliberately last: this is reached only if
-      // capture failed to record its own failure.
-    }
-  };
-
-  return {
-    requestChunk: (chunk) => guarded(() => opened.requestChunk(chunk)),
-    requestEnd: () => guarded(() => opened.requestEnd()),
-    responseStart: (status, headers) =>
-      guarded(() => opened.responseStart(status, headers)),
-    responseChunk: (chunk) => guarded(() => opened.responseChunk(chunk)),
-    end: (ending) => guarded(() => opened.end(ending)),
-  };
 }
 
 /** Inbound headers, minus the per-hop ones, keeping repeats as repeats. */

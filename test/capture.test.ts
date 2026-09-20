@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { setTimeout as delay } from "node:timers/promises";
 import { gzipSync } from "node:zlib";
 import { after, test } from "node:test";
+import { createCapture, type RequestCapture } from "../src/record/capture.ts";
+import type { Entry, Record } from "../src/record/record.ts";
 import { fixtureBody, readSseFixture, type SseFixture } from "./helpers/fake-upstream.ts";
 import { killAllSessions } from "./helpers/run-tap.ts";
 import { createProber, quit, responds } from "./helpers/session.ts";
@@ -269,4 +271,75 @@ test("a compressed response is read for usage without the agent seeing it decode
   assert.deepEqual(diagnostics, [], "decoding a copy is not a capture failure");
 
   await quit(session);
+});
+
+/**
+ * Fail-open has one owner, so capture is total against a record that is not:
+ * every method the proxy calls has to return normally however badly the record
+ * beneath it behaves. This is the in-process seam because the subject is
+ * capture's contract with the record, not anything process-shaped.
+ */
+
+/** A record that fails at whatever it is asked, keeping what it was told of it. */
+function hostileRecord(begin: () => Entry): { record: Record; failures: unknown[] } {
+  const failures: unknown[] = [];
+  // Cast because capture only ever reaches for `begin` and `diagnose`; giving
+  // the fake a `view`, a `freeze` and a `snapshot` it is never asked for would
+  // describe more of the seam than there is.
+  const record = {
+    begin,
+    diagnose: (_seq: number | null, detail: unknown) => failures.push(detail),
+  } as unknown as Record;
+  return { record, failures };
+}
+
+/** An entry that throws at every observation, and at being completed. */
+function brokenEntry(): Entry {
+  const explode = (): never => {
+    throw new Error("the record is broken");
+  };
+  return {
+    seq: 1,
+    type: "messages",
+    observeModel: explode,
+    observePayload: explode,
+    observeRawResponse: explode,
+    observeStatus: explode,
+    observeToolUse: explode,
+    observeUsage: explode,
+    complete: explode,
+  };
+}
+
+/** Drives one request through a capture, the way the proxy drives one. */
+function driveRequest(captured: RequestCapture): void {
+  captured.requestChunk(Buffer.from('{"model":"claude-opus-5"}'));
+  captured.requestEnd();
+  captured.responseStart(200, { "content-type": "application/json" });
+  captured.responseChunk(Buffer.from('{"usage":{"input_tokens":1}}'));
+  captured.end("closed");
+}
+
+test("no capture method throws, whatever the record it is writing to does", () => {
+  const { record, failures } = hostileRecord(brokenEntry);
+
+  const captured = createCapture(record).begin("POST", "/v1/messages");
+  assert.doesNotThrow(
+    () => driveRequest(captured),
+    "a capture step that throws into the proxy is a capture step in the agent's way",
+  );
+  assert.equal(failures.length, 1, "and the failure is written down rather than swallowed");
+});
+
+test("a capture that could not be opened is still a capture the proxy can call", () => {
+  const { record, failures } = hostileRecord(() => {
+    throw new Error("no entry for you");
+  });
+
+  const captured = createCapture(record).begin("POST", "/v1/messages");
+  assert.doesNotThrow(
+    () => driveRequest(captured),
+    "the proxy holds a capture handle whether or not an entry was opened for it",
+  );
+  assert.equal(failures.length, 1, "and the entry that could not be opened is reported once");
 });
