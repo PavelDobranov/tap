@@ -16,6 +16,12 @@ export interface SnapshotRequest {
    * main thread.
    */
   thread: number | null;
+  /**
+   * The turn of that thread the request is part of, numbered from 1 within
+   * the thread, or null when it is not grouped into one: no thread, or not
+   * conversation. Inferred from the shape of the messages, never stated.
+   */
+  turn: number | null;
   method: string;
   endpoint: string;
   model: string | null;

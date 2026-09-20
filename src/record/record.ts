@@ -7,6 +7,7 @@ import {
   type Skeleton,
 } from "./blobs.ts";
 import { createThreads, type Thread } from "./threads.ts";
+import { createTurns } from "./turns.ts";
 
 /**
  * Re-exported so that the snapshot is one interface rather than two: a
@@ -86,6 +87,18 @@ export interface RecordedRequest {
    * thread began. See `threads.ts`.
    */
   readonly thread: number | null;
+  /**
+   * The turn of that thread this request is part of, numbered from 1 in order
+   * of first appearance within the thread, or null when it is not grouped
+   * into one: a request with no thread, or one that is not conversation —
+   * a `count_tokens` shares a thread's prefix without being work in its turn.
+   *
+   * An inference on top of an inference, and a weaker one than the thread it
+   * sits in: it says this request looks like part of the work one prompt set
+   * off. See `turns.ts` for what it cannot see. A reader may switch it off;
+   * nothing else in the record depends on it.
+   */
+  readonly turn: number | null;
   readonly method: string;
   /** The request target as it arrived, path and query. */
   readonly endpoint: string;
@@ -223,6 +236,7 @@ export type Ending = "closed" | "cut";
 /** Row-sized facts that can change after a request starts. */
 export interface RequestChange {
   readonly thread?: number | null;
+  readonly turn?: number | null;
   /**
    * The payload, once it has been held. A request is published the moment it
    * starts, which is before its body has been read, so a viewer that only ever
@@ -345,6 +359,7 @@ export function createRecord(options: RecordOptions = {}): Record {
   const evictions: Eviction[] = [];
   const blobs = createBlobs();
   const threads = createThreads();
+  const turns = createTurns();
   /** Counted as events arrive, so a snapshot never re-measures the record. */
   let responseSize = 0;
   let revision = 0;
@@ -403,6 +418,7 @@ export function createRecord(options: RecordOptions = {}): Record {
         seq,
         type,
         thread: null,
+        turn: null,
         method,
         endpoint,
         model: null,
@@ -440,7 +456,16 @@ export function createRecord(options: RecordOptions = {}): Record {
             publish({ type: "blob-added", hash, blob });
           }
           const thread = threads.attribute(seq, stored.messageAddresses);
-          amend({ skeleton: stored.skeleton, thread }, { thread, skeleton: stored.skeleton });
+          // Only conversation is grouped into turns. A `count_tokens` request
+          // repeats a thread's messages to ask what they cost, which is not
+          // work in the turn they belong to, and an `other` request is one Tap
+          // cannot read at all: both stay ungrouped rather than being given an
+          // invented turn, and neither advances the count.
+          const turn = type === "messages" ? turns.attribute(thread, stored.finalMessage) : null;
+          amend(
+            { skeleton: stored.skeleton, thread, turn },
+            { thread, turn, skeleton: stored.skeleton },
+          );
           enforce();
           publish({ type: "storage", storage: storage() });
         },

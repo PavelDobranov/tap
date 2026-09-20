@@ -61,7 +61,7 @@ async function serve(options: { cap?: number } = {}): Promise<Served> {
 /** The rows the list is showing, as sequence numbers in the order they appear. */
 function shown(browser: Browser): number[] {
   return browser
-    .all("#requests tr")
+    .all("#requests tr[data-seq]")
     .filter((row) => !row.hidden)
     .map((row) => Number(row.dataset.seq));
 }
@@ -228,7 +228,7 @@ test("filters default to the main thread and messages, and always say what they 
   second.complete("closed");
 
   const browser = await served.open();
-  await browser.until("all four requests", () => browser.all("#requests tr").length === 4);
+  await browser.until("all four requests", () => browser.all("#requests tr[data-seq]").length === 4);
 
   assert.equal(browser.find("#thread").value, "main");
   assert.equal(browser.find("#type").value, "messages");
@@ -271,7 +271,7 @@ test("a filtered-out request is still in client state and still inspectable", as
   counting.complete("closed");
 
   const browser = await served.open();
-  await browser.until("the request to arrive", () => browser.all("#requests tr").length === 1);
+  await browser.until("the request to arrive", () => browser.all("#requests tr[data-seq]").length === 1);
   // Hidden by the default filters, and not discarded: showing every request
   // brings it back with the evidence intact, with no reconnection.
   assert.deepEqual(shown(browser), []);
@@ -295,7 +295,7 @@ test("two viewers select and filter independently while watching one record", as
   const reader = await served.open();
   const auditor = await served.open();
   for (const browser of [reader, auditor]) {
-    await browser.until("both requests", () => browser.all("#requests tr").length === 2);
+    await browser.until("both requests", () => browser.all("#requests tr[data-seq]").length === 2);
   }
 
   reader.click('#requests tr[data-seq="1"]');
@@ -312,7 +312,7 @@ test("two viewers select and filter independently while watching one record", as
   const third = served.record.begin("POST", "/v1/messages");
   third.observePayload(capturedPayload("a third request"));
   for (const browser of [reader, auditor]) {
-    await browser.until("the third request", () => browser.all("#requests tr").length === 3);
+    await browser.until("the third request", () => browser.all("#requests tr[data-seq]").length === 3);
   }
   assert.deepEqual(shown(reader), [1, 3]);
   assert.deepEqual(shown(auditor), [2]);

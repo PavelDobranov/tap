@@ -274,7 +274,7 @@ test("the served page renders the record's rows and applies later request change
   const browser = await openUi(ui.url);
   t.after(() => browser.close());
   const row = () => browser.find('#requests tr[data-seq="1"]');
-  await browser.until("the request to reach the page", () => browser.all("#requests tr").length === 1);
+  await browser.until("the request to reach the page", () => browser.all("#requests tr[data-seq]").length === 1);
   assert.deepEqual(
     row().children.slice(0, 5).map(({ textContent }) => textContent),
     ["1", "messages", "main", "claude-live", "in flight"],

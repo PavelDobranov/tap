@@ -64,8 +64,9 @@ export interface BlobMap {
 }
 
 /**
- * What holding one payload produced: the skeleton to reconstruct it from, and
- * the address of each of its messages, in wire order.
+ * What holding one payload produced: the skeleton to reconstruct it from, the
+ * address of each of its messages in wire order, and the last of those
+ * messages as it arrived.
  *
  * The addresses come out of here rather than being computed again elsewhere
  * because they are the addresses with the annotations already cut. A message
@@ -84,6 +85,21 @@ export interface Stored {
    * or a body that is not a JSON object at all.
    */
   readonly messageAddresses: readonly string[];
+  /**
+   * The last element of `messages[]`, as the bytes that arrived, or null when
+   * there was none. Handed back because turn derivation reads the shape of
+   * it, and the text is here already: finding it again would mean scanning
+   * the payload a second time, on the path a request crosses.
+   *
+   * Annotations are left in, unlike the addresses above. A moved cache
+   * breakpoint cannot change whose message it is or whether a tool result is
+   * in it, so cutting them here would cost a pass and buy nothing.
+   *
+   * To be read and dropped, never held: it is a slice of the payload, so
+   * anything that keeps it keeps the whole payload alive — the failure
+   * `detach` exists to stop.
+   */
+  readonly finalMessage: string | null;
 }
 
 /** What deduplication is costing and saving, and what eviction has dropped. */
@@ -221,10 +237,11 @@ export function createBlobs(): Blobs {
       if (located === null) {
         // Already its own string, so there is nothing to detach it from.
         literalBytes += Buffer.byteLength(payload);
-        return { skeleton: [payload], messageAddresses: [], additions };
+        return { skeleton: [payload], messageAddresses: [], finalMessage: null, additions };
       }
 
       const messageAddresses: string[] = [];
+      let finalMessage: Span | null = null;
       const parts: SkeletonPart[] = [];
       let literal = "";
       let cursor = 0;
@@ -243,7 +260,10 @@ export function createBlobs(): Blobs {
           (span) => span.from >= unit.from && span.to <= unit.to,
         );
         const { address, reference } = intern(payload, unit, cuts, seq);
-        if (unit.message) messageAddresses.push(address);
+        if (unit.message) {
+          messageAddresses.push(address);
+          finalMessage = unit;
+        }
         if (reference === null) {
           literal += payload.slice(unit.from, unit.to);
           continue;
@@ -254,7 +274,14 @@ export function createBlobs(): Blobs {
 
       literal += payload.slice(cursor);
       flush();
-      return { skeleton: parts, messageAddresses, additions };
+      return {
+        skeleton: parts,
+        messageAddresses,
+        // Not detached: this is read once, by the caller, and dropped. It is
+        // never held, so it cannot pin the payload it is a slice of.
+        finalMessage: finalMessage === null ? null : payload.slice(finalMessage.from, finalMessage.to),
+        additions,
+      };
     },
 
     map: () =>

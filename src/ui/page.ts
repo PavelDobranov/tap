@@ -23,8 +23,10 @@ export const PAGE = `<!doctype html>
 <div id="controls">
 <label for="thread">Thread</label><select id="thread"></select>
 <label for="type">Type</label><select id="type"><option value="messages">messages</option><option value="count_tokens">count_tokens</option><option value="other">other</option><option value="any">any type</option></select>
+<button type="button" id="turns" data-grouping="true">Turns: grouped</button>
 <button type="button" id="show-all">Show every request</button>
 </div>
+<p id="grouping-note">Turns are inferred from the shape of each request\u2019s messages, not stated by the wire. A divider can be in the wrong place; no request is hidden, dropped or reordered by one.</p>
 <p id="counts">0 requests</p>
 <div id="rows"><table><thead><tr><th>Sequence</th><th>Type</th><th>Thread</th><th>Model</th><th>Status</th><th>Started</th><th>Duration</th><th>Tokens / cache</th></tr></thead><tbody id="requests"></tbody></table></div>
 <p id="empty">Waiting for requests…</p>
@@ -53,6 +55,8 @@ export const APP = `(() => {
   const threadFilter = pick("thread");
   const typeFilter = pick("type");
   const showAll = pick("show-all");
+  const turnsToggle = pick("turns");
+  const groupingNote = pick("grouping-note");
   const evidence = pick("evidence-body");
   const prompt = pick("no-selection");
   const title = pick("selected-title");
@@ -73,7 +77,13 @@ export const APP = `(() => {
    * record knows about. It never filters what is held, so no other viewer
    * can see it and nothing here has to survive a re-snapshot.
    */
-  const viewing = { selected: null, thread: "main", type: "messages" };
+  const viewing = { selected: null, thread: "main", type: "messages", grouping: true };
+  /**
+   * The turns this viewer has folded away, by thread and turn. Presentation
+   * state like the filters: a folded turn is a row a reader is not looking
+   * at, never a request the page has stopped holding.
+   */
+  const collapsed = new Set();
   let threadValues = "";
 
   const fields = ["seq", "type", "thread", "model", "state", "started", "duration", "usage"];
@@ -118,8 +128,6 @@ export const APP = `(() => {
         const cell = document.createElement("td"); row.append(cell); return [name, cell];
       }));
       held = { row, cells }; rows.set(request.seq, held);
-      const after = [...body.children].find((candidate) => Number(candidate.dataset.seq) > request.seq);
-      body.insertBefore(row, after || null);
     }
     text(held.cells.seq, String(request.seq)); text(held.cells.type, request.type);
     text(held.cells.thread, request.thread == null ? "—" : request.thread === mainThread() ? "main" : "thread " + request.thread);
@@ -128,22 +136,131 @@ export const APP = `(() => {
     text(held.cells.duration, request.durationMs == null ? "—" : request.durationMs + " ms");
     text(held.cells.usage, usage(request.usage));
     held.row.dataset.selected = request.seq === viewing.selected ? "true" : "false";
-    held.row.hidden = !matches(request);
+    // A row redrawn on its own — a response event arriving, say — stays where
+    // the layout put it: a folded turn that unfolded itself because one of
+    // its requests was still streaming would be a list that moves under a
+    // reader who asked it to hold still.
+    held.row.hidden = away(request);
   };
 
-  // What is on screen and what is not, said in full and at all times: a
-  // filtered list that does not count what it is hiding is a screen a reader
-  // can confidently draw the wrong conclusion from.
-  const applyFilters = () => {
-    let hidden = 0;
-    requests.forEach((request) => {
-      const held = rows.get(request.seq);
-      const fits = matches(request);
-      if (!fits) hidden += 1;
-      if (held) held.row.hidden = !fits;
+  /**
+   * Whether a request is off screen, and the only rule that decides it: the
+   * filters are hiding it, or the turn it is grouped into is folded away.
+   * Neither is the record forgetting it.
+   */
+  const away = (request) => !matches(request) || collapsed.has(groupKey(request));
+
+  /**
+   * The group a request is read in: its turn, within its thread. Null where
+   * there is none to read it in — grouping is off, or the record left the
+   * request ungrouped because it is not conversation.
+   */
+  const groupKey = (request) =>
+    viewing.grouping && request.turn != null && request.thread != null
+      ? request.thread + ":" + request.turn
+      : null;
+
+  const label = (run, folded) =>
+    (folded ? "\u25b8 " : "\u25be ") +
+    (run.thread === mainThread() ? "" : "thread " + run.thread + " \u00b7 ") +
+    "turn " + run.turn + " \u00b7 inferred \u00b7 " + plural(run.size, "request") +
+    (run.resumed ? " \u00b7 resumed" : "");
+
+  /** The divider a run of a turn begins at, and the one thing that folds it. */
+  const divider = (run) => {
+    const folded = collapsed.has(run.key);
+    const row = document.createElement("tr");
+    row.className = "turn";
+    row.dataset.turn = String(run.turn);
+    row.dataset.thread = String(run.thread);
+    row.dataset.collapsed = folded ? "true" : "false";
+    const cell = document.createElement("td");
+    cell.setAttribute("colspan", String(fields.length));
+    cell.textContent = label(run, folded);
+    row.append(cell);
+    row.addEventListener("click", () => {
+      if (folded) collapsed.delete(run.key); else collapsed.add(run.key);
+      redraw();
     });
+    return row;
+  };
+
+  /**
+   * The runs the visible list falls into: one per divider, in the order they
+   * appear, each the stretch of adjacent requests of one turn.
+   *
+   * A turn is a run rather than the whole turn because wire order comes
+   * first. Two threads interleave, and a count_tokens request lands mid-loop, so
+   * the requests of one turn need not be adjacent — and gathering them would
+   * mean reordering the list, which grouping is never allowed to do. A turn
+   * picked up again after something else is a second divider saying so, and
+   * each divider counts the requests under it rather than the turn's, so a
+   * heading never claims rows that are not beneath it.
+   */
+  const runs = (ordered) => {
+    const found = new Map();
+    const seen = new Set();
+    let open = null;
+    for (const request of ordered) {
+      if (!matches(request)) continue;
+      const key = groupKey(request);
+      if (key === null) {
+        open = null;
+        continue;
+      }
+      if (open === null || open.key !== key) {
+        open = { key, turn: request.turn, thread: request.thread, size: 0, resumed: seen.has(key) };
+        seen.add(key);
+        // Keyed by the request the divider goes above.
+        found.set(request.seq, open);
+      }
+      open.size += 1;
+    }
+    return found;
+  };
+
+  /**
+   * The list as it reads down the page: every request in wire order, with a
+   * divider where an inferred turn begins or is picked up again.
+   *
+   * Grouping is a layer over the list and never the list itself. Rows are
+   * the same elements whether they are grouped, folded or filtered away —
+   * they are re-ordered into nothing, dropped from nothing, and a divider in
+   * the wrong place costs a reader a misplaced heading and nothing else.
+   */
+  const layout = () => {
+    const ordered = [...requests.values()].sort((first, second) => first.seq - second.seq);
+    // Worked out before anything is drawn, so that a divider can say how many
+    // requests it is holding while it is holding them out of sight.
+    const dividers = runs(ordered);
+
+    const children = [];
+    let hidden = 0;
+    let folded = 0;
+    for (const request of ordered) {
+      const held = rows.get(request.seq);
+      if (!held) continue;
+      const run = dividers.get(request.seq);
+      if (run !== undefined) children.push(divider(run));
+      const gone = away(request);
+      if (!matches(request)) hidden += 1;
+      else if (gone) folded += 1;
+      held.row.hidden = gone;
+      children.push(held.row);
+    }
+    body.replaceChildren(...children);
+    return { hidden, folded };
+  };
+
+  // The list redrawn, and what is on screen and what is not said in full and
+  // at all times: a list that does not count what it is hiding — behind a
+  // filter or inside a folded turn — is a screen a reader can confidently
+  // draw the wrong conclusion from.
+  const redraw = () => {
+    const { hidden, folded } = layout();
     counts.textContent = plural(requests.size, "request") + " · " +
-      (hidden === 0 ? "none hidden" : hidden + " hidden");
+      (hidden === 0 ? "none hidden" : hidden + " hidden") +
+      (folded === 0 ? "" : " · " + folded + " collapsed into turns");
     empty.hidden = requests.size - hidden > 0;
     empty.textContent = requests.size === 0
       ? "Waiting for requests…"
@@ -261,19 +378,19 @@ export const APP = `(() => {
     for (const hash of Object.keys(held)) blobs.set(hash, held[hash]);
     value.requests.forEach((request) => { requests.set(request.seq, request); render(request); });
     if (viewing.selected != null && !requests.has(viewing.selected)) viewing.selected = null;
-    threadOptions(); applyFilters(); renderEvidence();
+    threadOptions(); redraw(); renderEvidence();
     if (value.lifecycle.phase === "frozen") freeze(value.lifecycle.agent);
   };
 
   const delta = (event) => {
     if (event.type === "request-start") {
       requests.set(event.request.seq, event.request);
-      render(event.request); threadOptions(); applyFilters();
+      render(event.request); threadOptions(); redraw();
     } else if (event.type === "request-change") {
       const request = requests.get(event.seq);
       if (!request) return;
       Object.assign(request, event.changes);
-      render(request); threadOptions(); applyFilters();
+      render(request); threadOptions(); redraw();
       if (viewing.selected === event.seq) renderEvidence();
     } else if (event.type === "raw-response") {
       const request = requests.get(event.seq);
@@ -295,15 +412,26 @@ export const APP = `(() => {
     } else if (event.type === "frozen") freeze(event.agent);
   };
 
-  threadFilter.addEventListener("change", () => { viewing.thread = threadFilter.value; applyFilters(); });
-  typeFilter.addEventListener("change", () => { viewing.type = typeFilter.value; applyFilters(); });
+  threadFilter.addEventListener("change", () => { viewing.thread = threadFilter.value; redraw(); });
+  typeFilter.addEventListener("change", () => { viewing.type = typeFilter.value; redraw(); });
+  turnsToggle.addEventListener("click", () => {
+    viewing.grouping = !viewing.grouping;
+    // Dropped rather than remembered: the flat list is the whole of the
+    // record in wire order, and a turn folded before grouping was switched
+    // off would fold requests a reader had asked to see all of.
+    if (!viewing.grouping) collapsed.clear();
+    turnsToggle.dataset.grouping = String(viewing.grouping);
+    turnsToggle.textContent = viewing.grouping ? "Turns: grouped" : "Turns: flat";
+    groupingNote.hidden = !viewing.grouping;
+    redraw();
+  });
   showAll.addEventListener("click", () => {
     viewing.thread = "any"; viewing.type = "any";
     threadFilter.value = "any"; typeFilter.value = "any";
-    applyFilters();
+    redraw();
   });
   typeFilter.value = viewing.type;
-  threadOptions(); applyFilters();
+  threadOptions(); redraw();
 
   const token = new URL(location.href).searchParams.get("token");
   const source = new EventSource("/api/events" + (token ? "?token=" + encodeURIComponent(token) : ""));
@@ -323,6 +451,10 @@ header div{display:flex;gap:16px;align-items:center}header strong{color:#7ee2a8;
 #controls label{color:#98a39c;font-size:11px;text-transform:uppercase;letter-spacing:.08em}
 select,button{font:inherit;color:inherit;background:#1c211e;border:1px solid #39413b;padding:4px 8px}
 button{cursor:pointer}button:hover{background:#242b26}
+#grouping-note{margin:0;padding:8px 12px;color:#98a39c;border-bottom:1px solid #2b302d}
+tr.turn{cursor:pointer;background:#1a201d}tr.turn:hover{background:#212925}
+tr.turn td{color:#7ee2a8;font-size:11px;text-transform:uppercase;letter-spacing:.08em;white-space:normal}
+tr.turn[data-collapsed=true] td{color:#cfa85f}
 #counts{margin:0;padding:8px 12px;color:#98a39c;border-bottom:1px solid #2b302d}
 #rows{overflow:auto}table{width:100%;border-collapse:collapse}
 th,td{text-align:left;padding:10px 12px;border-bottom:1px solid #2b302d;white-space:nowrap}

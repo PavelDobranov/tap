@@ -221,10 +221,13 @@ that guessed at them would hide the thing being designed for.
 _Avoid_: detail, transcript, request view
 
 **Presentation state**:
-What one viewer is looking at: which request is selected, and which filters
-are applied. It lives in the browser and nowhere else, so two viewers of one
+What one viewer is looking at: which request is selected, which filters are
+applied, whether the list is grouped into turns, and which of those turns are
+folded away. It lives in the browser and nowhere else, so two viewers of one
 record read it independently and neither can change what the other sees. The
-server stays authoritative for the record itself.
+server stays authoritative for the record itself — including the turn each
+request is in, which is derived once at capture and only ever *displayed*
+here.
 _Avoid_: view state, UI state, session state
 
 **Snapshot**:
