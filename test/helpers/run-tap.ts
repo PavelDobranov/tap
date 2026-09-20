@@ -85,7 +85,11 @@ export async function startLaunch(
 }
 
 /**
- * Runs the built `tap` executable — the one seam the test suite uses.
+ * Runs the built `tap` executable — the seam for everything whose subject is
+ * the process: the terminal, signals, `PATH`, the configurations Tap refuses,
+ * exit codes and packaging. Anything whose subject is the record or the viewer
+ * goes through the other seam and starts Tap's modules in-process. See
+ * ADR-0009 for the line between them.
  */
 export function runTap(
   args: string[],
