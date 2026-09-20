@@ -10,13 +10,13 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { createFakeAgent } from "./helpers/fake-agent.ts";
 import { freePort, killAllSessions, startTap, type TapSession } from "./helpers/run-tap.ts";
-import { quit } from "./helpers/session.ts";
+import { createProber, quit } from "./helpers/session.ts";
 import { ask, printedUrl, snapshotAt } from "./helpers/snapshot.ts";
 import { createCapture } from "../src/record/capture.ts";
 import { createRecord } from "../src/record/record.ts";
 import { startProxy } from "../src/proxy/proxy.ts";
 import { startUi } from "../src/ui/server.ts";
-import { startFakeUpstream } from "./helpers/fake-upstream.ts";
+import { readSseFixture, startFakeUpstream } from "./helpers/fake-upstream.ts";
 
 const agent = createFakeAgent();
 after(() => agent.remove());
@@ -98,6 +98,8 @@ interface SseMessage {
 
 interface SseViewer {
   next(): Promise<SseMessage>;
+  /** Runs `act` the moment the opening frame's first bytes arrive. */
+  disturb(act: () => void): void;
   close(): void;
 }
 
@@ -111,16 +113,32 @@ function openEvents(url: string): Promise<SseViewer> {
     req.once("response", (response) => {
       assert.equal(response.statusCode, 200);
       response.setEncoding("utf8");
+      let disturb: (() => void) | null = null;
       let buffered = "";
+      // Where the last search for a frame boundary gave up. Without it, a
+      // snapshot of any size is rescanned from the start on every chunk, which
+      // is quadratic in exactly the case worth testing.
+      let searched = 0;
       const messages: SseMessage[] = [];
       const waiting: ((message: SseMessage) => void)[] = [];
       response.on("data", (chunk: string) => {
+        // Fired once, on the first bytes of the opening frame: the only moment
+        // at which a test can put the record and the snapshot in a race.
+        if (disturb !== null) {
+          const act = disturb;
+          disturb = null;
+          act();
+        }
         buffered += chunk;
         for (;;) {
-          const boundary = buffered.indexOf("\n\n");
-          if (boundary < 0) break;
+          const boundary = buffered.indexOf("\n\n", searched);
+          if (boundary < 0) {
+            searched = Math.max(0, buffered.length - 1);
+            break;
+          }
           const frame = buffered.slice(0, boundary);
           buffered = buffered.slice(boundary + 2);
+          searched = 0;
           const fields = Object.fromEntries(
             frame.split("\n").map((line) => {
               const colon = line.indexOf(":");
@@ -138,6 +156,9 @@ function openEvents(url: string): Promise<SseViewer> {
         }
       });
       resolve({
+        disturb: (act: () => void) => {
+          disturb = act;
+        },
         next: () =>
           new Promise((receive) => {
             const message = messages.shift();
@@ -390,8 +411,11 @@ test("a viewer under backpressure is disposable and a later viewer gets a fresh 
 
   const closed = new Promise<void>((resolve) => response.once("close", () => resolve()));
   const entry = record.begin("POST", "/v1/messages");
+  // A viewer that has stopped reading is one whose backlog keeps growing, not
+  // one that merely took a write past the socket's high-water mark: capture
+  // keeps publishing to it at full speed until it is plainly not draining.
   const beforeCapture = performance.now();
-  entry.observeRawResponse("x".repeat(64 * 1024));
+  for (let event = 0; event < 40; event += 1) entry.observeRawResponse("x".repeat(64 * 1024));
   const captureDelay = performance.now() - beforeCapture;
   assert.ok(captureDelay < 125, `stalled viewer delayed capture by ${captureDelay.toFixed(1)}ms`);
   response.resume();
@@ -637,4 +661,371 @@ test("--port after the agent name belongs to the agent, not to Tap", async () =>
   await quit(session);
 
   assert.deepEqual(JSON.parse(readFileSync(argvFile, "utf8")), ["--port", "9"]);
+});
+
+const prober = createProber("ui-live");
+after(() => prober.dispose());
+
+/** Drives one request across a live Tap session's proxy and drains the answer. */
+async function crossProxy(port: number): Promise<void> {
+  const streamed = readThroughProxy(`http://127.0.0.1:${port}`);
+  await streamed.gaps;
+}
+
+test("a request crossing a live Tap session's proxy reaches an open viewer as it happens", async () => {
+  const upstream = await prober.upstream({ stream: readSseFixture("message-stream") });
+  // The probe makes one request and stays up, which is how the test learns the
+  // proxy's port while the session is still live.
+  const probed = await prober.probe([{}], upstream.baseUrl, "transcript");
+  const viewer = await openEvents(probed.url);
+
+  try {
+    const opening = await viewer.next();
+    assert.equal(opening.event, "snapshot");
+    const { snapshot } = opening.data as { snapshot: { requests: { seq: number }[] } };
+    assert.deepEqual(snapshot.requests.map(({ seq }) => seq), [1]);
+
+    // A second request crosses the proxy with the viewer already watching: it
+    // must arrive as deltas on this connection, with no second fetch.
+    await crossProxy(probed.proxyPort());
+
+    const deltas: SseMessage[] = [];
+    const about = () =>
+      deltas.filter(({ data }) => (data as { seq?: number; request?: { seq: number } }).seq === 2 ||
+        (data as { request?: { seq: number } }).request?.seq === 2);
+    const completed = () =>
+      about().some(({ data }) =>
+        (data as { type: string; changes?: { completedAt?: string | null } }).type ===
+          "request-change" &&
+        (data as { changes?: { completedAt?: string | null } }).changes?.completedAt != null);
+    while (!completed()) deltas.push(await viewer.next());
+
+    const mine = about();
+    assert.ok(deltas.every(({ event }) => event === "delta"));
+    const ids = deltas.map(({ id }) => id);
+    assert.deepEqual(ids, ids.toSorted((x, y) => x - y), "revisions must only increase");
+
+    // Wire order: the second request to reach the proxy is the second row.
+    const start = mine[0]!;
+    assert.equal((start.data as { type: string }).type, "request-start");
+    assert.equal((start.data as { request: { seq: number; type: string } }).request.seq, 2);
+    assert.equal((start.data as { request: { type: string } }).request.type, "messages");
+
+    // The row makes incoming response activity visible before it completes.
+    assert.ok(
+      mine.some(({ data }) => (data as { type: string }).type === "raw-response"),
+      "the viewer should see the response arriving",
+    );
+
+    const changes = Object.assign(
+      {},
+      ...mine
+        .filter(({ data }) => (data as { type: string }).type === "request-change")
+        .map(({ data }) => (data as { changes: object }).changes),
+    ) as {
+      status?: number;
+      model?: string | null;
+      thread?: number | null;
+      completedAt?: string | null;
+      durationMs?: number | null;
+      usage?: { inputTokens?: number; cacheReadInputTokens?: number } | null;
+    };
+    assert.equal(changes.status, 200);
+    assert.equal(changes.thread, 1);
+    // The model is read off the request as soon as it is forwarded, then
+    // refined to whatever the response says actually served it.
+    const models = mine
+      .map(({ data }) => (data as { changes?: { model?: string | null } }).changes?.model)
+      .filter((model) => model !== undefined);
+    assert.deepEqual(models, ["claude-test", "claude-opus-5"]);
+    assert.equal(changes.model, "claude-opus-5");
+    assert.equal(typeof changes.durationMs, "number");
+    assert.equal(changes.usage?.inputTokens, 417);
+    assert.equal(changes.usage?.cacheReadInputTokens, 3840);
+  } finally {
+    viewer.close();
+    probed.session.type("exit");
+    await quit(probed.session);
+  }
+});
+
+test("a request concurrent with connection setup arrives exactly once, after the snapshot", async () => {
+  // Big enough that the opening snapshot is written in many pieces, so a
+  // request can genuinely land in the middle of one.
+  const record = createRecord();
+  for (let seq = 1; seq <= 40; seq += 1) {
+    const entry = record.begin("POST", "/v1/messages");
+    entry.observePayload(
+      JSON.stringify({ model: "claude-test", messages: [{ role: "user", content: `${seq}: ${"p".repeat(4096)}` }] }),
+    );
+    entry.complete("closed");
+  }
+  const ui = await startUi(record, await freePort());
+  const viewer = await openEvents(ui.url);
+
+  try {
+    // The request lands the instant the opening frame starts flowing, so the
+    // connection has a snapshot half-written when the record moves under it.
+    viewer.disturb(() => record.begin("POST", "/v1/messages"));
+
+    const opening = await viewer.next();
+    assert.equal(opening.event, "snapshot");
+    const { snapshot } = opening.data as {
+      snapshot: { requests: { seq: number }[]; revision: number };
+    };
+    // Whichever side of the snapshot it fell, it is there once and once only.
+    const inSnapshot = snapshot.requests.filter(({ seq }) => seq === 41).length;
+    assert.ok(inSnapshot <= 1);
+
+    const delta = await viewer.next();
+    assert.equal(delta.event, "delta");
+    assert.ok(delta.id > snapshot.revision, "a delta must follow the snapshot's revision");
+    const started = (delta.data as { type: string; request?: { seq: number } });
+    const inDeltas = started.type === "request-start" && started.request?.seq === 41 ? 1 : 0;
+    assert.equal(inSnapshot + inDeltas, 1, "the request must appear exactly once");
+  } finally {
+    viewer.close();
+    await ui.close();
+  }
+});
+
+test("an agent killed by a signal freezes the record as a signal, not as a code", async () => {
+  const { session, url } = await inspectable();
+
+  session.type("signal SIGTERM");
+  await session.waitForError(/frozen/);
+
+  const frozen = await snapshotAt(url.href);
+  assert.deepEqual(frozen.lifecycle, {
+    phase: "frozen",
+    agent: { code: null, signal: "SIGTERM" },
+  });
+
+  session.interrupt();
+  await session.exited;
+});
+
+test("every line of browser code is Tap's own and reaches nothing remote", async (t) => {
+  const record = createRecord();
+  const ui = await startUi(record, await freePort());
+  t.after(() => ui.close());
+  const url = new URL(ui.url);
+  const fetchText = async (route: string): Promise<string> => {
+    const answer = await ask(Number(url.port), `${route}${url.search}`, {
+      headers: { host: url.host },
+    });
+    assert.equal(answer.status, 200);
+    return answer.body;
+  };
+
+  const page = await fetchText("/");
+  const app = await fetchText("/app.js");
+  const style = await fetchText("/style.css");
+
+  for (const [name, source] of [["page", page], ["app.js", app], ["style.css", style]] as const) {
+    assert.doesNotMatch(source, /https?:\/\//, `${name} must name no remote origin`);
+    assert.doesNotMatch(source, /\bsrc\s*=\s*["']\/\//, `${name} must use no protocol-relative URL`);
+    assert.doesNotMatch(source, /@import/, `${name} must import nothing`);
+  }
+  // Everything the page loads is a route this server serves itself.
+  const referenced = [...page.matchAll(/(?:src|href)="([^"]*)"/g)].map(([, value]) => value);
+  assert.deepEqual(referenced.toSorted(), ["/app.js", "/style.css"]);
+  assert.doesNotMatch(app, /\bfetch\s*\(|XMLHttpRequest|importScripts/);
+  // The only connection it opens is the live one, on this origin.
+  assert.deepEqual([...app.matchAll(/new EventSource\(([^)]*)\)/g)].length, 1);
+  assert.match(app, /new EventSource\("\/api\/events"/);
+});
+
+test("the token never appears in the record's events, diagnostics, or Tap's output", async () => {
+  const upstream = await prober.upstream({ stream: readSseFixture("message-stream") });
+  const probed = await prober.probe([{}], upstream.baseUrl, "transcript");
+  const token = new URL(probed.url).searchParams.get("token")!;
+  const viewer = await openEvents(probed.url);
+
+  try {
+    const frames: SseMessage[] = [await viewer.next()];
+    await crossProxy(probed.proxyPort());
+    while (!frames.some(({ data }) => (data as { type?: string }).type === "request-change")) {
+      frames.push(await viewer.next());
+    }
+    for (const frame of frames) {
+      assert.ok(!JSON.stringify(frame.data).includes(token), `${frame.event} carried the token`);
+    }
+
+    const snapshot = await probed.snapshot();
+    assert.ok(!JSON.stringify(snapshot).includes(token), "the snapshot carried the token");
+
+    // Printed once, as the address a viewer needs, and written down nowhere else.
+    assert.ok(!probed.session.stdout().includes(token), "stdout carried the token");
+    const lines = probed.session.stderr().split("\n").filter((line) => line.includes(token));
+    assert.equal(lines.length, 1, "the token belongs to the printed URL alone");
+    assert.match(lines[0]!, /^tap: inspect this session at http:\/\/127\.0\.0\.1:\d+\/\?token=/);
+  } finally {
+    viewer.close();
+    probed.session.type("exit");
+    await quit(probed.session);
+  }
+});
+
+test("a stalled viewer is dropped on its own while another keeps receiving", async () => {
+  const record = createRecord();
+  const ui = await startUi(record, await freePort());
+  const target = new URL(ui.url);
+  target.pathname = "/api/events";
+
+  // One viewer that stops reading, and one that keeps up.
+  const stalling = httpRequest(target);
+  const stalled = await new Promise<import("node:http").IncomingMessage>((resolve, reject) => {
+    stalling.once("response", resolve);
+    stalling.once("error", reject);
+    stalling.end();
+  });
+  await new Promise<void>((resolve) => stalled.once("data", () => resolve()));
+  const healthy = await openEvents(ui.url);
+  assert.equal((await healthy.next()).event, "snapshot");
+
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  stalled.pause();
+
+  const dropped = new Promise<void>((resolve) => stalled.once("close", () => resolve()));
+
+  try {
+    // Spread over ticks, the way response events actually arrive: a viewer
+    // that is reading drains each one, and only the viewer that is not reading
+    // accumulates. A burst published in one synchronous run would leave every
+    // viewer equally behind, which is not what a stalled viewer means.
+    const entry = record.begin("POST", "/v1/messages");
+    for (let event = 0; event < 80; event += 1) {
+      entry.observeRawResponse("x".repeat(256 * 1024));
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    entry.observeStatus(200);
+    entry.complete("closed");
+
+    // The stalled viewer goes, and no catch-up buffer is kept for it.
+    stalled.resume();
+    await Promise.race([
+      dropped,
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("the stalled viewer stayed connected")), 2_000)),
+    ]);
+
+    // The viewer that kept reading is untouched: it still has the whole
+    // record, down to the response events the stalled one was dropped over.
+    const kinds: string[] = [];
+    const completed = () =>
+      kinds.includes("completed");
+    while (!completed()) {
+      const message = await healthy.next();
+      assert.equal(message.event, "delta");
+      const data = message.data as { type: string; changes?: { completedAt?: string | null } };
+      kinds.push(data.type);
+      if (data.type === "request-change" && data.changes?.completedAt != null) kinds.push("completed");
+    }
+    assert.ok(kinds.includes("request-start"));
+    assert.equal(kinds.filter((kind) => kind === "raw-response").length, 80);
+
+    // And it is still live afterwards, rather than quietly wedged.
+    record.begin("GET", "/later");
+    let after = await healthy.next();
+    while ((after.data as { type: string }).type !== "request-start") after = await healthy.next();
+    assert.equal((after.data as { request: { seq: number } }).request.seq, 2);
+  } finally {
+    healthy.close();
+    stalling.destroy();
+    await new Promise((resolve) => setImmediate(resolve));
+    await ui.close();
+  }
+});
+
+test("a record too big for one socket buffer still opens with a complete snapshot", async () => {
+  // The opening snapshot is the one thing a viewer cannot do without, and a
+  // record this size is exactly the one worth opening the UI on: filling the
+  // socket while writing it is ordinary, not a stalled viewer.
+  const record = createRecord({ cap: 128 * 1024 * 1024 });
+  const requests = 50;
+  for (let seq = 1; seq <= requests; seq += 1) {
+    const entry = record.begin("POST", "/v1/messages");
+    entry.observePayload(
+      JSON.stringify({
+        model: "claude-test",
+        messages: [{ role: "user", content: `${seq}: ${"p".repeat(64 * 1024)}` }],
+      }),
+    );
+    entry.observeRawResponse(`data: ${"r".repeat(64 * 1024)}\n\n`);
+    entry.complete("closed");
+  }
+  const ui = await startUi(record, await freePort());
+  const viewer = await openEvents(ui.url);
+
+  try {
+    const opening = await viewer.next();
+    assert.equal(opening.event, "snapshot");
+    const { snapshot } = opening.data as {
+      snapshot: { requests: { seq: number }[]; revision: number };
+    };
+    assert.equal(snapshot.requests.length, requests);
+    assert.deepEqual(
+      snapshot.requests.map(({ seq }) => seq),
+      snapshot.requests.map((_, index) => index + 1),
+    );
+
+    // And the connection is still good for the deltas that follow it. The
+    // pause lets the server finish opening: a delta racing the end of the
+    // snapshot is the separate concern tested above.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    record.begin("GET", "/later");
+    const next = await viewer.next();
+    assert.equal(next.event, "delta");
+    assert.equal((next.data as { type: string }).type, "request-start");
+    assert.equal((next.data as { request: { seq: number } }).request.seq, requests + 1);
+    assert.ok(next.id > snapshot.revision);
+  } finally {
+    viewer.close();
+    await ui.close();
+  }
+});
+
+test("a viewer opens on the first try while the record is still moving", async () => {
+  // The case the UI exists for: a record busy enough to be worth watching.
+  // Disposing the connection on the first change that lands mid-snapshot
+  // would mean this viewer never finishes opening at all.
+  const record = createRecord({ cap: 128 * 1024 * 1024 });
+  for (let seq = 1; seq <= 50; seq += 1) {
+    const entry = record.begin("POST", "/v1/messages");
+    entry.observePayload(
+      JSON.stringify({
+        model: "claude-test",
+        messages: [{ role: "user", content: `${seq}: ${"p".repeat(64 * 1024)}` }],
+      }),
+    );
+    entry.complete("closed");
+  }
+  const ui = await startUi(record, await freePort());
+  const streaming = record.begin("POST", "/v1/messages");
+  const ticking = setInterval(() => streaming.observeRawResponse("data: chunk\n\n"), 5);
+
+  const viewer = await openEvents(ui.url);
+  try {
+    const opening = await viewer.next();
+    assert.equal(opening.event, "snapshot");
+    const { snapshot } = opening.data as {
+      snapshot: { requests: { seq: number }[]; revision: number };
+    };
+    assert.equal(snapshot.requests.length, 51);
+
+    // And the deltas that piled up behind it follow, in order, on the same
+    // connection rather than after a reconnect.
+    let last = snapshot.revision;
+    for (let delta = 0; delta < 5; delta += 1) {
+      const message = await viewer.next();
+      assert.equal(message.event, "delta");
+      assert.ok(message.id > last, `revision ${message.id} must follow ${last}`);
+      last = message.id;
+    }
+  } finally {
+    clearInterval(ticking);
+    viewer.close();
+    await ui.close();
+  }
 });

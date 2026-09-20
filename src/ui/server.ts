@@ -8,6 +8,22 @@ export const DEFAULT_UI_PORT = 8270;
 const ORIGINS = [LOOPBACK, "localhost"];
 const TOKEN_COOKIE = "tap_token";
 
+/**
+ * How far behind a viewer may fall before it is disposed: the bytes Node is
+ * still holding for a socket that has not drained them.
+ *
+ * `write` returning false is not a stalled viewer. It says only that the last
+ * write went past the stream's high-water mark, which a single ordinary
+ * response event does on its own — so disposing on that alone drops every
+ * viewer the moment the record gets busy, and none of them ever sees the
+ * event that did it. What a stalled viewer actually looks like is an
+ * outstanding buffer that keeps growing, and this is the ceiling on one.
+ *
+ * Nothing is queued above the socket, so this is the whole of what one viewer
+ * can cost, and reaching it disposes that viewer and no other.
+ */
+const VIEWER_BACKLOG_LIMIT = 1024 * 1024;
+
 export interface Ui {
   /** The whole address a viewer needs, token included. */
   readonly url: string;
@@ -138,14 +154,25 @@ function routeHeaders(pathname: string): { [header: string]: string } | null {
 }
 
 /**
- * Registers before taking the snapshot. If the record changes while the
- * opening frame is being written, this connection is disposed and EventSource
- * reconnects for a fresh snapshot; no viewer owns a catch-up buffer.
+ * Registers before taking the snapshot, so nothing that happens after it can
+ * be missed, and holds what arrives while the opening frame is still going out
+ * until it has gone — the snapshot has to reach the viewer before the deltas
+ * that follow it, and a record mid-stream changes many times in the time one
+ * takes to write.
+ *
+ * That hold is the opposite of a catch-up buffer: it is bounded, it exists
+ * only until the snapshot is out, and a viewer that overruns it is disposed
+ * to re-snapshot rather than being caught up. Disposing on the first change
+ * instead would mean a record busy enough to be worth watching could never
+ * finish opening at all.
  */
 async function streamEvents(res: ServerResponse, record: Record): Promise<void> {
   let opening = true;
   let closed = false;
   let view: ReturnType<Record["view"]> | null = null;
+  /** Deltas published while the snapshot is still going out, in order. */
+  const waiting: string[] = [];
+  let waitingBytes = 0;
 
   const dispose = (): void => {
     if (closed) return;
@@ -153,13 +180,27 @@ async function streamEvents(res: ServerResponse, record: Record): Promise<void> 
     view?.close();
     if (!res.destroyed) res.destroy();
   };
+  // Hands the event straight to the socket and returns: never awaited, never
+  // queued above the socket, so a viewer cannot delay the capture publishing
+  // to it. A viewer whose backlog has run away is dropped instead.
   const send = ({ revision, event }: RevisionedEvent): void => {
     if (closed) return;
+    const text = frame("delta", revision, event);
     if (opening) {
+      waitingBytes += text.length;
+      if (waitingBytes > VIEWER_BACKLOG_LIMIT) dispose();
+      else waiting.push(text);
+      return;
+    }
+    // Measured before the write, not after: what says a viewer has stalled is
+    // that it has not drained what it was already sent, never the size of the
+    // event in hand. Checking afterwards would dispose an attentive viewer for
+    // the one large blob it asked for and had every chance of reading.
+    if (res.destroyed || res.writableLength > VIEWER_BACKLOG_LIMIT) {
       dispose();
       return;
     }
-    if (!res.write(frame("delta", revision, event))) dispose();
+    res.write(text);
   };
 
   view = record.view(send);
@@ -169,6 +210,18 @@ async function streamEvents(res: ServerResponse, record: Record): Promise<void> 
     dispose();
     return;
   }
+  // Nothing is awaited between here and the last write, so no further event
+  // can slip in front of what was held: the viewer sees the snapshot, then
+  // every revision after it, in order and each exactly once.
+  if (closed) return;
+  for (const text of waiting) {
+    if (res.destroyed) {
+      dispose();
+      return;
+    }
+    res.write(text);
+  }
+  waiting.length = 0;
   opening = false;
 }
 
@@ -176,15 +229,53 @@ function frame(event: string, revision: number, data: unknown): string {
   return `event: ${event}\nid: ${revision}\ndata: ${JSON.stringify(data)}\n\n`;
 }
 
-/** Small writes let the socket expose a genuinely stalled viewer promptly. */
+/**
+ * Writes the opening snapshot in small pieces, letting the socket fill and
+ * waiting for it only once it is genuinely full, rather than giving up on the
+ * first piece that passes the high-water mark: a snapshot is the one thing a
+ * viewer cannot do without, and a record big enough to fill a socket is
+ * exactly the record worth opening the UI on. Yielding between pieces is what
+ * keeps serving it off the path a request crosses.
+ */
 async function writeOpeningFrame(res: ServerResponse, snapshot: Snapshot): Promise<boolean> {
   const text = frame("snapshot", snapshot.revision, { revision: snapshot.revision, snapshot });
   const piece = 8 * 1024;
   for (let at = 0; at < text.length; at += piece) {
-    if (res.destroyed || !res.write(text.slice(at, at + piece))) return false;
-    await yieldToOtherRequests();
+    if (res.destroyed || res.writableEnded) return false;
+    res.write(text.slice(at, at + piece));
+    // Waiting on every piece would put a round trip between each of them and
+    // serve a large record at a crawl. Waiting only once the socket is
+    // genuinely full keeps the outstanding bytes bounded by the same ceiling a
+    // live viewer is held to, which is the whole of what this connection costs.
+    if (res.writableLength > VIEWER_BACKLOG_LIMIT && !(await drained(res))) return false;
+    // Only between pieces: a yield after the last one buys nothing and widens
+    // the window in which a viewer that already has the whole snapshot is
+    // disposed for a delta it could simply have been sent.
+    if (at + piece < text.length) await yieldToOtherRequests();
   }
   return true;
+}
+
+/**
+ * Resolves once the socket has caught up, or false if it went away first.
+ * The one place that waits on a socket: both the snapshot routes push until
+ * the socket is full and then come here, and they differ only in how they say
+ * a viewer has gone.
+ */
+function drained(res: ServerResponse): Promise<boolean> {
+  return new Promise((resolve) => {
+    const settle = (answer: boolean) => {
+      res.off("drain", ok);
+      res.off("close", gone);
+      res.off("error", gone);
+      resolve(answer);
+    };
+    const ok = () => settle(true);
+    const gone = () => settle(false);
+    res.once("drain", ok);
+    res.once("close", gone);
+    res.once("error", gone);
+  });
 }
 
 /** A refusal says only that it refused: never why, and never the token. */
@@ -242,28 +333,7 @@ function yieldToOtherRequests(): Promise<void> {
 async function writeChunk(res: ServerResponse, chunk: string): Promise<void> {
   if (res.destroyed || res.writableEnded) throw new ResponseClosed();
   if (res.write(chunk)) return;
-  await new Promise<void>((resolve, reject) => {
-    const cleanup = () => {
-      res.off("drain", drained);
-      res.off("close", closed);
-      res.off("error", failed);
-    };
-    const drained = () => {
-      cleanup();
-      resolve();
-    };
-    const closed = () => {
-      cleanup();
-      reject(new ResponseClosed());
-    };
-    const failed = (error: Error) => {
-      cleanup();
-      reject(error);
-    };
-    res.once("drain", drained);
-    res.once("close", closed);
-    res.once("error", failed);
-  });
+  if (!(await drained(res))) throw new ResponseClosed();
 }
 
 class ResponseClosed extends Error {}

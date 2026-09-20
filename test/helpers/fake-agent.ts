@@ -17,8 +17,10 @@ export interface FakeAgent {
 /**
  * The default body: records the arguments it was given, announces itself, and
  * then stays interactive until stdin tells it to exit, so a test can observe a
- * running agent. `exit <code>` exits with that code; `echo <word>` writes a
- * line. Set `FAKE_AGENT_EXIT` to exit immediately instead.
+ * running agent. `exit <code>` exits with that code; `signal <name>` kills it
+ * with that signal, which is the only honest way to produce an agent that
+ * exited by signal rather than by code; `echo <word>` writes a line. Set
+ * `FAKE_AGENT_EXIT` to exit immediately instead.
  */
 export const INTERACTIVE_AGENT = `
 const { writeFileSync } = require("node:fs");
@@ -35,6 +37,7 @@ if (immediate !== undefined) process.exit(Number(immediate));
 createInterface({ input: process.stdin }).on("line", (line) => {
   const [command, argument] = line.trim().split(/\\s+/);
   if (command === "exit") process.exit(Number(argument ?? "0"));
+  if (command === "signal") process.kill(process.pid, argument ?? "SIGTERM");
   if (command === "echo") process.stdout.write("agent: " + argument + "\\n");
 });
 `;
