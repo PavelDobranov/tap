@@ -13,6 +13,7 @@ import { DEFAULT_UI_PORT, PortInUseError, startUi } from "../ui/server.ts";
 import { exitOnInterrupt, ignoreSigint, restoreSigint } from "../signals.ts";
 import { EXIT_FAILURE, EXIT_OK, EXIT_USAGE, type Io } from "./io.ts";
 import { OptionError, readLaunchOptions } from "./options.ts";
+import { waitForEnter } from "./prompt.ts";
 
 /**
  * Launches an agent and owns the Tap session around it: live while the agent
@@ -28,6 +29,12 @@ import { OptionError, readLaunchOptions } from "./options.ts";
  * The UI server has the opposite lifetime. It is bound first, so that a port
  * clash ends the launch before an agent has been started and abandoned, and it
  * is never closed: serving the record is what the frozen phase is for.
+ *
+ * At a terminal the launch waits on Enter once the address is out. The agent
+ * repaints the screen as it starts, and the address is unrecoverable once
+ * gone, so the wait is what makes the live phase reachable at all; see
+ * `waitForEnter`. A Ctrl+C during it still ends Tap, which is what a Ctrl+C
+ * before there is an agent means.
  *
  * SIGINT is held from before the agent is spawned until the frozen session
  * takes it over, so there is no instant at which a Ctrl+C meant for the agent
@@ -90,6 +97,11 @@ export async function launch(argv: readonly string[], io: Io): Promise<number> {
   // The one line Tap writes before the agent has the terminal, and the last
   // until the agent gives it back.
   io.stderr.write(`tap: inspect this session at ${ui.url}\n`);
+  await waitForEnter(
+    `tap: open it now — ${invocation.command} takes the terminal next.\n` +
+      `tap: press Enter to start it. `,
+    io,
+  );
 
   let outcome;
   ignoreSigint();

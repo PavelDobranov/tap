@@ -20,12 +20,21 @@ remains readable — until you interrupt it.
 
 ## Reading the record
 
-Tap prints one line before the agent takes over, with the URL to read the
-session at:
+Before the agent takes over, Tap prints the URL to read the session at and
+holds there:
 
 ```
 tap: inspect this session at http://127.0.0.1:8270/?token=...
+tap: open it now — claude takes the terminal next.
+tap: press Enter to start it.
 ```
+
+At a terminal the launch waits there until you press Enter. The agent repaints
+the screen as it starts, and the address cannot be worked out again afterwards
+— its token is minted for this session — so the wait is what keeps the live
+phase reachable. With stdin or stderr redirected there is nothing to wait for
+and nothing repainting the screen, so Tap keeps to its one line and launches
+straight away.
 
 That address opens the live request list. It is reachable only from this
 machine, only with the token in the URL, and only under a `Host` naming Tap's
