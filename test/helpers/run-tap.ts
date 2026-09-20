@@ -1,17 +1,22 @@
 import { execFile, spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import type { AgentExit } from "../../src/agent/run.ts";
 
-export interface RunResult {
+/**
+ * What a process the suite ran left behind: its output, and how it ended.
+ *
+ * The end is `AgentExit` itself rather than a restatement of it. Most of what
+ * the suite runs is Tap or the fake agent, the assertions are about the exits
+ * Tap produces and reports, and a suite that spelled those a second way could
+ * go on passing while the spelling Tap uses changed under it.
+ */
+export interface RunResult extends AgentExit {
   stdout: string;
   stderr: string;
-  /** Exit code, or 128 + signal number when the process was killed. */
-  code: number;
 }
 
 export const repoRoot = new URL("../../", import.meta.url);
-
-const SIGNAL_NUMBERS: Record<string, number> = { SIGINT: 2, SIGKILL: 9, SIGTERM: 15 };
 
 /**
  * The environment a `tap` under test is started in: this process's, minus the
@@ -32,9 +37,10 @@ function childEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
 }
 
 /**
- * Runs a command and resolves with its outcome. Never rejects: a nonzero exit
+ * Runs a command and resolves with how it ended. Never rejects: a nonzero exit
  * is something to assert on, not an error. A signal death is reported as a
- * nonzero code so a crashed process can never be mistaken for success.
+ * signal, not as `128 + n`: a test that wants to know a process was killed
+ * should not have to read it out of an exit code Tap itself never produces.
  */
 export function run(
   command: string,
@@ -51,17 +57,23 @@ export function run(
         encoding: "utf8",
       },
       (error, stdout, stderr) => {
-        resolve({ stdout, stderr, code: exitCodeOf(error) });
+        resolve({ stdout, stderr, ...exitOf(error) });
       },
     );
   });
 }
 
-function exitCodeOf(error: (Error & { code?: unknown; signal?: unknown }) | null): number {
-  if (error === null) return 0;
-  if (typeof error.code === "number") return error.code;
-  if (typeof error.signal === "string") return 128 + (SIGNAL_NUMBERS[error.signal] ?? 0);
-  return 1;
+/** `execFile`'s error, read back as the exit it stands for. */
+function exitOf(error: (Error & { code?: unknown; signal?: unknown }) | null): AgentExit {
+  if (error === null) return { code: 0, signal: null };
+  if (typeof error.signal === "string") {
+    return { code: null, signal: error.signal as NodeJS.Signals };
+  }
+  if (typeof error.code === "number") return { code: error.code, signal: null };
+  // Neither, so nothing ran to an exit: the command was not found, or could
+  // not be spawned, and `code` is an errno string. A timeout does not land
+  // here — `execFile` kills the child, which arrives as the signal above.
+  return { code: 1, signal: null };
 }
 
 /**
@@ -109,15 +121,6 @@ export function readManifest(): {
   return JSON.parse(readFileSync(new URL("package.json", repoRoot), "utf8"));
 }
 
-export interface TapSessionResult {
-  stdout: string;
-  stderr: string;
-  /** Null when the process was killed by a signal. */
-  code: number | null;
-  /** Null when the process exited of its own accord. */
-  signal: NodeJS.Signals | null;
-}
-
 /**
  * A `tap` process a test can watch and interrupt, for the commands that outlive
  * the agent and so cannot be waited on with `runTap`.
@@ -135,7 +138,7 @@ export interface TapSession {
   waitForOutput(pattern: RegExp): Promise<void>;
   /** Resolves once `pattern` has appeared in stderr; rejects on a timeout. */
   waitForError(pattern: RegExp): Promise<void>;
-  exited: Promise<TapSessionResult>;
+  exited: Promise<RunResult>;
 }
 
 const WAIT_TIMEOUT_MS = 10_000;
@@ -187,7 +190,7 @@ export function startTap(
     for (const notify of watchers) notify();
   });
 
-  const exited = new Promise<TapSessionResult>((resolve) => {
+  const exited = new Promise<RunResult>((resolve) => {
     child.on("close", (code, signal) => {
       resolve({ stdout, stderr, code, signal });
     });

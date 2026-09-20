@@ -27,6 +27,15 @@ The agent's *own* conversation identity, which can span several processes
 try to; it is never what "session" means in Tap's code or CLI.
 _Avoid_: session (unqualified)
 
+**Agent exit**:
+How the agent ended: an exit code or a signal, exactly one of which is set. One
+type, `AgentExit`, defined where the agent is run and used by everything that
+is typed and reads it — the record freezes on it, the tests assert on it, and
+the UI reads the same two fields out of the snapshot. The two are never
+collapsed into one number: a signal death is a normal end to an interactive
+session, and `128 + n` spends that distinction to save a field.
+_Avoid_, for the pair: outcome, status, result, exit code
+
 **Frozen**:
 The state of a Tap session after the agent has exited: the record stops growing
 but stays readable until Tap is interrupted.

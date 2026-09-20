@@ -2,21 +2,19 @@ import { spawn } from "node:child_process";
 import type { Invocation } from "./claude.ts";
 
 /**
- * How an agent process ended. Exit code and signal are kept apart because a
- * signal death is a normal end to an interactive session, not a failure, and
- * the distinction has to stay legible to whatever reads the record.
+ * How the agent ended: the one definition, used by the agent layer that
+ * produces it, the record that freezes on it, and the tests that assert on it.
+ *
+ * Exit code and signal are kept apart, and exactly one of them is ever set,
+ * because a signal death is a normal end to an interactive session rather than
+ * a failure. Collapsing the two — a signal reported as `128 + n` — throws away
+ * the distinction the record keeps deliberately, so nothing here does it.
  */
-export interface AgentOutcome {
+export interface AgentExit {
   /** Null when the agent was killed by a signal. */
   readonly code: number | null;
   /** Null when the agent exited of its own accord. */
   readonly signal: NodeJS.Signals | null;
-}
-
-/** How an agent's end reads to a human. */
-export function describeOutcome(command: string, outcome: AgentOutcome): string {
-  if (outcome.signal !== null) return `${command} was terminated by ${outcome.signal}`;
-  return `${command} exited with code ${outcome.code ?? 0}`;
 }
 
 /** An agent that could not be started, as opposed to one that ran and failed. */
@@ -42,8 +40,8 @@ export class AgentNotFoundError extends Error {
 export function runAgent(
   invocation: Invocation,
   overrides: NodeJS.ProcessEnv = {},
-): Promise<AgentOutcome> {
-  return new Promise<AgentOutcome>((resolve, reject) => {
+): Promise<AgentExit> {
+  return new Promise<AgentExit>((resolve, reject) => {
     const child = spawn(invocation.command, invocation.args, {
       stdio: "inherit",
       env: { ...process.env, ...overrides },

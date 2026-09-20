@@ -73,8 +73,11 @@ test("the package installs globally with no compilation step and runs", async ()
   }
 });
 
-test("the run helper reports a signal death as a nonzero code", async () => {
+test("the run helper reports a signal death as a signal, not as a code", async () => {
   const killed = await run(process.execPath, ["-e", "process.kill(process.pid, 'SIGKILL')"]);
 
-  assert.notEqual(killed.code, 0);
+  assert.deepEqual(
+    { code: killed.code, signal: killed.signal },
+    { code: null, signal: "SIGKILL" },
+  );
 });

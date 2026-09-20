@@ -6,8 +6,15 @@ import {
   type PayloadStorage,
   type Skeleton,
 } from "./blobs.ts";
+import type { AgentExit } from "../agent/run.ts";
 import { createThreads, type Thread } from "./threads.ts";
 import { createTurns } from "./turns.ts";
+
+/**
+ * Re-exported so that a reader of the record does not have to reach into the
+ * agent layer for the shape the frozen lifecycle is stated in.
+ */
+export type { AgentExit };
 
 /**
  * Re-exported so that the snapshot is one interface rather than two: a
@@ -187,11 +194,6 @@ export interface Storage extends PayloadStorage {
   readonly cap: number;
 }
 
-export interface AgentExit {
-  readonly code: number | null;
-  readonly signal: NodeJS.Signals | null;
-}
-
 export type Lifecycle =
   | { readonly phase: "live" }
   | { readonly phase: "frozen"; readonly agent: AgentExit };
@@ -348,7 +350,8 @@ export interface Record {
   diagnose(seq: number | null, detail: unknown): void;
   /** Atomically takes a snapshot and follows every later revision. */
   view(receive: (event: RevisionedEvent) => void): RecordView;
-  freeze(outcome: AgentExit): void;
+  /** Ends the live phase on the agent's exit; the first call wins. */
+  freeze(exit: AgentExit): void;
   snapshot(): Snapshot;
 }
 
@@ -513,10 +516,10 @@ export function createRecord(options: RecordOptions = {}): Record {
       return { snapshot: initial, close: () => viewers.delete(receive) };
     },
 
-    freeze(outcome) {
+    freeze(exit) {
       if (lifecycle.phase === "frozen") return;
-      lifecycle = { phase: "frozen", agent: outcome };
-      publish({ type: "frozen", agent: outcome });
+      lifecycle = { phase: "frozen", agent: exit };
+      publish({ type: "frozen", agent: exit });
     },
 
     // Copied down to the raw events, because a snapshot is the record as it

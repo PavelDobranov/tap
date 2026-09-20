@@ -4,7 +4,7 @@ import {
   readInvocation,
   UnknownAgentError,
 } from "../agent/claude.ts";
-import { AgentNotFoundError, describeOutcome, runAgent } from "../agent/run.ts";
+import { AgentNotFoundError, runAgent, type AgentExit } from "../agent/run.ts";
 import { startProxy } from "../proxy/proxy.ts";
 import { resolveUpstream } from "../proxy/upstream.ts";
 import { createCapture } from "../record/capture.ts";
@@ -103,10 +103,12 @@ export async function launch(argv: readonly string[], io: Io): Promise<number> {
     io,
   );
 
-  let outcome;
+  // Named rather than inferred: this is where the exit crosses from the agent
+  // layer into the record, and the annotation says so at the crossing.
+  let exit: AgentExit;
   ignoreSigint();
   try {
-    outcome = await runAgent(invocation, { ANTHROPIC_BASE_URL: proxy.baseUrl });
+    exit = await runAgent(invocation, { ANTHROPIC_BASE_URL: proxy.baseUrl });
   } catch (error) {
     restoreSigint();
     // Both ports go with the session: there is no agent to record and no
@@ -121,9 +123,15 @@ export async function launch(argv: readonly string[], io: Io): Promise<number> {
     await proxy.close();
   }
 
-  record.freeze(outcome);
+  record.freeze(exit);
+  // How the exit reads to a human. Stated here rather than in a function of
+  // its own: there is one line of Tap's that says it, and this is the line.
+  const howItEnded =
+    exit.signal !== null
+      ? `was terminated by ${exit.signal}`
+      : `exited with code ${exit.code ?? 0}`;
   io.stderr.write(
-    `tap: ${describeOutcome(invocation.command, outcome)}\n` +
+    `tap: ${invocation.command} ${howItEnded}\n` +
       `tap: session frozen; press Ctrl+C to exit tap\n`,
   );
 

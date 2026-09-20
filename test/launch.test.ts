@@ -8,7 +8,7 @@ import {
   killAllSessions,
   runLaunch,
   startLaunch,
-  type TapSessionResult,
+  type RunResult,
   type TapSession,
 } from "./helpers/run-tap.ts";
 
@@ -31,7 +31,7 @@ function env(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
 }
 
 /** Waits for the session to freeze, then quits it the way a user would. */
-async function quitFrozenSession(session: TapSession): Promise<TapSessionResult> {
+async function quitFrozenSession(session: TapSession): Promise<RunResult> {
   await session.waitForError(/frozen/);
   session.interrupt();
   return session.exited;
