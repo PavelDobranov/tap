@@ -19,8 +19,10 @@ const TOKEN_COOKIE = "tap_token";
  * event that did it. What a stalled viewer actually looks like is an
  * outstanding buffer that keeps growing, and this is the ceiling on one.
  *
- * Nothing is queued above the socket, so this is the whole of what one viewer
- * can cost, and reaching it disposes that viewer and no other.
+ * The same ceiling bounds the opening hold, which is the one place a viewer's
+ * bytes sit above the socket, and it lives only until the snapshot is out.
+ * Outside that window nothing is queued above the socket at all. Reaching the
+ * ceiling either way disposes that viewer and no other.
  */
 const VIEWER_BACKLOG_LIMIT = 1024 * 1024;
 
@@ -180,14 +182,17 @@ async function streamEvents(res: ServerResponse, record: Record): Promise<void> 
     view?.close();
     if (!res.destroyed) res.destroy();
   };
-  // Hands the event straight to the socket and returns: never awaited, never
-  // queued above the socket, so a viewer cannot delay the capture publishing
-  // to it. A viewer whose backlog has run away is dropped instead.
+  // Hands the event straight to the socket and returns: never awaited, so a
+  // viewer cannot delay the capture publishing to it. Nothing is queued above
+  // the socket except during the opening frame, and that hold is bounded by
+  // the same ceiling. A viewer whose backlog has run away is dropped instead.
   const send = ({ revision, event }: RevisionedEvent): void => {
     if (closed) return;
     const text = frame("delta", revision, event);
     if (opening) {
-      waitingBytes += text.length;
+      // Bytes, not characters: what the ceiling and `writableLength` both
+      // count is what goes on the wire, which is this text as UTF-8.
+      waitingBytes += Buffer.byteLength(text);
       if (waitingBytes > VIEWER_BACKLOG_LIMIT) dispose();
       else waiting.push(text);
       return;

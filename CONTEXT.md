@@ -203,7 +203,14 @@ _Avoid_: subagent, subagent session, delegation
 The local web page Tap serves, and the only way to read the record. Served on
 its own port, separate from the proxy, `Host`-validated and reachable only with
 the token in its URL, because it exposes the entire captured context.
-_Avoid_: dashboard, viewer, TUI, frontend
+_Avoid_: dashboard, TUI, frontend
+
+**Viewer**:
+One connection watching the record live — a snapshot, then everything after it.
+A viewer is disposable: one that falls behind is dropped on its own and
+reconnects to a fresh snapshot, because nothing in the record depends on anyone
+watching it. Distinct from the **UI**, which is the page a viewer is opened by.
+_Avoid_: client, subscriber, listener, watcher
 
 **Snapshot**:
 The whole record as it stands, sent to a viewer when it connects. Followed by a
