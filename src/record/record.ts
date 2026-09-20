@@ -223,6 +223,13 @@ export type Ending = "closed" | "cut";
 /** Row-sized facts that can change after a request starts. */
 export interface RequestChange {
   readonly thread?: number | null;
+  /**
+   * The payload, once it has been held. A request is published the moment it
+   * starts, which is before its body has been read, so a viewer that only ever
+   * sees deltas would have a row it could never show the evidence for. It
+   * costs a live viewer no more than the snapshot it would get by reloading.
+   */
+  readonly skeleton?: Skeleton | null;
   readonly model?: string | null;
   readonly status?: number | null;
   readonly completedAt?: string | null;
@@ -433,7 +440,7 @@ export function createRecord(options: RecordOptions = {}): Record {
             publish({ type: "blob-added", hash, blob });
           }
           const thread = threads.attribute(seq, stored.messageAddresses);
-          amend({ skeleton: stored.skeleton, thread }, { thread });
+          amend({ skeleton: stored.skeleton, thread }, { thread, skeleton: stored.skeleton });
           enforce();
           publish({ type: "storage", storage: storage() });
         },

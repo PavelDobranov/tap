@@ -3,11 +3,11 @@ import { createServer, request as httpRequest } from "node:http";
 import { connect } from "node:net";
 import { networkInterfaces } from "node:os";
 import { performance } from "node:perf_hooks";
-import { runInNewContext } from "node:vm";
 import { after, test } from "node:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { openUi } from "./helpers/browser.ts";
 import { createFakeAgent } from "./helpers/fake-agent.ts";
 import { freePort, killAllSessions, startTap, type TapSession } from "./helpers/run-tap.ts";
 import { createProber, quit } from "./helpers/session.ts";
@@ -262,76 +262,30 @@ test("the printed URL serves the local request list with hardened browser header
 });
 
 
-test("the browser script renders snapshot rows and applies later request changes", async (t) => {
+test("the served page renders the record's rows and applies later request changes", async (t) => {
   const record = createRecord();
   const ui = await startUi(record, await freePort());
   t.after(() => ui.close());
-  const url = new URL(ui.url);
-  const script = await ask(Number(url.port), `/app.js${url.search}`, { headers: { host: url.host } });
 
-  class Element {
-    readonly children: Element[] = [];
-    readonly dataset: { [name: string]: string } = {};
-    textContent = "";
-    hidden = false;
-    append(child: Element): void { this.children.push(child); }
-    insertBefore(child: Element, before: Element | null): void {
-      const at = before === null ? -1 : this.children.indexOf(before);
-      if (at < 0) this.children.push(child);
-      else this.children.splice(at, 0, child);
-    }
-    replaceChildren(): void { this.children.length = 0; }
-  }
-  const requests = new Element();
-  const elements: { [selector: string]: Element } = {
-    "#requests": requests,
-    "#empty": new Element(),
-    "#connection": new Element(),
-    "#lifecycle": new Element(),
-  };
-  const page = new Element();
-  let source!: {
-    listeners: { [event: string]: (message: { data: string }) => void };
-  };
-  class EventSource {
-    readonly listeners: { [event: string]: (message: { data: string }) => void } = {};
-    constructor(_target: string) { source = this; }
-    addEventListener(event: string, receive: (message: { data: string }) => void): void {
-      this.listeners[event] = receive;
-    }
-  }
-  runInNewContext(script.body, {
-    URL,
-    location: { href: ui.url },
-    EventSource,
-    document: {
-      body: page,
-      querySelector: (selector: string) => elements[selector],
-      createElement: () => new Element(),
-    },
-  });
+  const entry = record.begin("POST", "/v1/messages");
+  entry.observePayload('{"model":"claude-live","messages":[{"role":"user","content":"hello"}]}');
+  entry.observeModel("claude-live");
 
-  const request = {
-    seq: 1, type: "messages", thread: 1, model: "claude-live", status: null,
-    startedAt: "2025-01-01T12:00:00.000Z", completedAt: null, durationMs: null,
-    usage: null, rawResponse: [], interrupted: false,
-  };
-  source.listeners.snapshot!({
-    data: JSON.stringify({ snapshot: { requests: [request], lifecycle: { phase: "live" } } }),
-  });
-  assert.equal(requests.children.length, 1);
-  assert.deepEqual(requests.children[0]!.children.slice(0, 5).map(({ textContent }) => textContent),
-    ["1", "messages", "main", "claude-live", "in flight"]);
+  const browser = await openUi(ui.url);
+  t.after(() => browser.close());
+  const row = () => browser.find('#requests tr[data-seq="1"]');
+  await browser.until("the request to reach the page", () => browser.all("#requests tr").length === 1);
+  assert.deepEqual(
+    row().children.slice(0, 5).map(({ textContent }) => textContent),
+    ["1", "messages", "main", "claude-live", "in flight"],
+  );
 
-  source.listeners.delta!({
-    data: JSON.stringify({ type: "request-change", seq: 1, changes: {
-      status: 200, completedAt: "2025-01-01T12:00:01.000Z", durationMs: 1000,
-      usage: { inputTokens: 12, outputTokens: 3 },
-    } }),
-  });
-  const cells = requests.children[0]!.children;
-  assert.equal(cells[4]!.textContent, "200");
-  assert.equal(cells[6]!.textContent, "1000 ms");
+  entry.observeStatus(200);
+  entry.observeUsage({ inputTokens: 12, outputTokens: 3 });
+  entry.complete("closed");
+  await browser.until("the request to complete", () => row().children[4]!.textContent === "200");
+  const cells = row().children;
+  assert.match(cells[6]!.textContent, /^\d+ ms$/);
   assert.equal(cells[7]!.textContent, "in 12 · out 3");
 });
 

@@ -212,6 +212,21 @@ reconnects to a fresh snapshot, because nothing in the record depends on anyone
 watching it. Distinct from the **UI**, which is the page a viewer is opened by.
 _Avoid_: client, subscriber, listener, watcher
 
+**Evidence**:
+What Tap can show about one request without interpreting it: the payload
+reconstructed from its skeleton, and the raw response events in arrival order.
+Deliberately uninterpreted — no message rendering, no diff — because those
+representations are designed *from* the shapes evidence exposes, and a view
+that guessed at them would hide the thing being designed for.
+_Avoid_: detail, transcript, request view
+
+**Presentation state**:
+What one viewer is looking at: which request is selected, and which filters
+are applied. It lives in the browser and nowhere else, so two viewers of one
+record read it independently and neither can change what the other sees. The
+server stays authoritative for the record itself.
+_Avoid_: view state, UI state, session state
+
 **Snapshot**:
 The whole record as it stands, sent to a viewer when it connects. Followed by a
 live stream of everything after it, so opening the UI late or reloading it
