@@ -362,6 +362,25 @@ function cut(
 }
 
 /**
+ * One part of a reconstructed payload, and whether it is a hole rather than
+ * bytes that arrived. A reader that only wants the payload joins the text; a
+ * reader that shows it to someone marks the holes.
+ */
+export interface ReconstructedPart {
+  readonly text: string;
+  readonly hole: boolean;
+}
+
+/**
+ * Where reconstruction reads a blob from. A function rather than the map
+ * itself because the readers of a skeleton do not agree on how they hold
+ * blobs — the record has an object keyed by address, a viewer has a `Map` it
+ * fills as the record publishes additions — and the rule should not have to
+ * care which.
+ */
+export type BlobLookup = (hash: string) => { readonly json: string } | undefined;
+
+/**
  * What stands in a reconstructed payload where an evicted unit used to be.
  *
  * Part of the snapshot's documented interface, and deliberately not JSON: a
@@ -375,7 +394,26 @@ export function evictedHole(hash: string): string {
 }
 
 /**
- * A payload as it arrived, from its skeleton and the blobs it refers to.
+ * A blob's JSON with the annotations that were cut from it put back.
+ *
+ * Each annotation's offset indexes the text the blob holds — the text with
+ * every annotation already cut out — so the cursor is set to the recorded
+ * offset and never advanced past the text just inserted. Advancing past it
+ * would make each annotation displace the next one by its own length.
+ */
+function restoreAnnotations(json: string, annotations: readonly Annotation[]): string {
+  let restored = "";
+  let cursor = 0;
+  for (const annotation of annotations) {
+    restored += json.slice(cursor, annotation.at) + annotation.text;
+    cursor = annotation.at;
+  }
+  return restored + json.slice(cursor);
+}
+
+/**
+ * A payload as it arrived, in parts: the skeleton's text as it stands, and
+ * each reference filled from the blob map with its annotations put back.
  *
  * The inverse of `store`, and exactly as documented an interface: a reader of
  * the snapshot — the UI, or anything else — reconstructs with this rule and
@@ -386,27 +424,41 @@ export function evictedHole(hash: string): string {
  * which would lose the request along with the unit, and never a silent gap,
  * which is the failure that makes a reader draw a confident wrong conclusion.
  */
+export function reconstructParts(skeleton: Skeleton, blobAt: BlobLookup): ReconstructedPart[] {
+  return skeleton.map((part) => {
+    if (typeof part === "string") return { text: part, hole: false };
+    const held = blobAt(part.blob);
+    if (held === undefined) return { text: evictedHole(part.blob), hole: true };
+    return { text: restoreAnnotations(held.json, part.annotations), hole: false };
+  });
+}
+
+/** The payload a skeleton stands for, joined, holes and all. */
 export function reconstruct(skeleton: Skeleton, blobs: BlobMap): string {
-  return skeleton
-    .map((part) => {
-      if (typeof part === "string") return part;
-      const blob = blobs[part.blob];
-      if (blob === undefined) return evictedHole(part.blob);
-      return restore(blob.json, part.annotations);
-    })
+  return reconstructParts(skeleton, (hash) => blobs[hash])
+    .map((part) => part.text)
     .join("");
 }
 
-/** A blob's JSON with the annotations that were cut from it put back. */
-function restore(json: string, annotations: readonly Annotation[]): string {
-  let restored = "";
-  let cursor = 0;
-  for (const annotation of annotations) {
-    restored += json.slice(cursor, annotation.at) + annotation.text;
-    cursor = annotation.at;
-  }
-  return restored + json.slice(cursor);
-}
+/**
+ * The reconstruction rule as JavaScript source, for a reader that cannot
+ * import it.
+ *
+ * The page runs in a browser with nothing fetched from anywhere else, so it
+ * has to carry the rule rather than call it. It carries this one: the same
+ * functions, shipped across the record→viewer seam instead of copied across
+ * it, so the hole literal and the annotation cursor cannot drift.
+ *
+ * Declarations, so the order they are emitted in does not matter, and
+ * self-contained, so the only names they need are each other's.
+ */
+export const RECONSTRUCTION_SOURCE: string = [
+  evictedHole,
+  restoreAnnotations,
+  reconstructParts,
+]
+  .map((rule) => rule.toString())
+  .join("\n\n");
 
 function round(value: number): number {
   return Math.round(value * 100) / 100;

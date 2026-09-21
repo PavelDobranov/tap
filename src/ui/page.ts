@@ -1,3 +1,5 @@
+import { RECONSTRUCTION_SOURCE } from "../record/blobs.ts";
+
 /**
  * The page Tap serves, as the three files a browser asks for.
  *
@@ -6,6 +8,11 @@
  * with nothing fetched from anywhere else. Keeping it beside the server that
  * serves it, rather than inside it, is only so that the transport and the page
  * can be read separately.
+ *
+ * The one exception is the reconstruction rule, which the record defines and
+ * this page receives as source. A viewer that carried its own copy would be a
+ * second spelling of the rule that decides what a reader sees for an evicted
+ * unit, and the two would drift.
  *
  * The page is an *evidence* view, deliberately: it shows the payload Tap
  * reconstructed and the response events as they arrived, and interprets
@@ -292,26 +299,11 @@ export const APP = `(() => {
     threadFilter.value = viewing.thread;
   };
 
-  // The rule the snapshot documents: the skeleton's text as it stands, each
-  // reference filled from the blob map with its annotations put back, and a
-  // marked hole where a blob has been evicted. Never nothing — a gap a reader
-  // cannot see reads as a shorter conversation than the one that happened.
-  const holeText = (hash) => "/* tap evicted this unit to stay under its cap: " + hash + " */";
-  const restore = (json, annotations) => {
-    let restored = "";
-    let cursor = 0;
-    for (const annotation of annotations) {
-      restored += json.slice(cursor, annotation.at) + annotation.text;
-      cursor = annotation.at;
-    }
-    return restored + json.slice(cursor);
-  };
-  const payloadParts = (skeleton) => skeleton.map((part) => {
-    if (typeof part === "string") return { text: part, hole: false };
-    const blob = blobs.get(part.blob);
-    if (!blob) return { text: holeText(part.blob), hole: true };
-    return { text: restore(blob.json, part.annotations), hole: false };
-  });
+  // The record's own reconstruction rule, shipped here rather than copied:
+  // the page cannot import it, so the record hands over its source and it is
+  // emitted below verbatim. The hole literal and the annotation cursor have
+  // one spelling, in \`src/record/blobs.ts\`.
+${RECONSTRUCTION_SOURCE}
   const references = (request, hash) =>
     request != null && request.skeleton != null &&
     request.skeleton.some((part) => typeof part !== "string" && part.blob === hash);
@@ -332,7 +324,9 @@ export const APP = `(() => {
     title.textContent = "Request " + request.seq + " · " + request.type + " · " +
       request.method + " " + request.endpoint;
 
-    const parts = request.skeleton == null ? [] : payloadParts(request.skeleton);
+    const parts = request.skeleton == null
+      ? []
+      : reconstructParts(request.skeleton, (hash) => blobs.get(hash));
     const holes = parts.filter((part) => part.hole).length;
     payload.replaceChildren(...parts.map((part) => {
       if (!part.hole) return document.createTextNode(part.text);

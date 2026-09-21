@@ -3,7 +3,7 @@ import { after, test } from "node:test";
 import { openUi, type Browser } from "./helpers/browser.ts";
 import { readSseFixture } from "./helpers/fake-upstream.ts";
 import { freePort, killAllSessions } from "./helpers/run-tap.ts";
-import { ask, payloadOf, snapshotAt } from "./helpers/snapshot.ts";
+import { ask } from "./helpers/snapshot.ts";
 import { createProber, quit } from "./helpers/session.ts";
 import { createRecord, type Record } from "../src/record/record.ts";
 import { startUi, type Ui } from "../src/ui/server.ts";
@@ -83,13 +83,6 @@ test("selecting a request shows the payload Tap captured, byte for byte", async 
   assert.deepEqual(JSON.parse(browser.text("#payload")), JSON.parse(payload));
   assert.match(browser.text("#selected-title"), /1\b/);
   assert.equal(browser.find("#evidence-body").hidden, false);
-
-  // The page and a reader applying the documented rule to the same snapshot
-  // must agree. The page carries its own copy of the rule, because it runs in
-  // a browser and cannot import Tap's; this is what says the copies have not
-  // drifted apart.
-  const snapshot = await snapshotAt(served.ui.url);
-  assert.equal(browser.text("#payload"), payloadOf(snapshot, snapshot.requests[0]!));
 });
 
 test("raw response events append live, in arrival order, while the request is in flight", async (t) => {
@@ -174,11 +167,6 @@ test("an evicted unit leaves a marked hole that cannot be read as the payload", 
   // And the marks say so, rather than leaving a reader to notice the comment.
   assert.match(browser.text("#evidence-marks"), /evicted/i);
   assert.ok(browser.all("#payload mark").length > 0, "a hole must be marked in the page");
-
-  // And the hole is the one the documented rule puts there, not a second
-  // spelling of it invented by the page.
-  const snapshot = await snapshotAt(served.ui.url);
-  assert.equal(text, payloadOf(snapshot, snapshot.requests[0]!));
 });
 
 test("an interrupted response is marked and keeps every event that arrived", async () => {

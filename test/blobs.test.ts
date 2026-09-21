@@ -3,7 +3,16 @@ import { test } from "node:test";
 import { runInNewContext } from "node:vm";
 import { setFlagsFromString } from "node:v8";
 import { canonicalJson } from "../src/record/canonical.ts";
-import { createBlobs, reconstruct, type Skeleton } from "../src/record/blobs.ts";
+import {
+  createBlobs,
+  evictedHole,
+  reconstruct,
+  reconstructParts,
+  RECONSTRUCTION_SOURCE,
+  type BlobMap,
+  type ReconstructedPart,
+  type Skeleton,
+} from "../src/record/blobs.ts";
 import type { RequestType } from "../src/record/record.ts";
 
 /**
@@ -125,6 +134,83 @@ test("a breakpoint is put back wherever it sat in the message", () => {
     3,
     "the first three differ only in where the breakpoint sits, so they are one blob",
   );
+});
+
+test("cut then restore hands a unit back with every annotation where it was", () => {
+  // The round trip, asserted on the rule itself rather than only through a
+  // browser reading a snapshot. Two breakpoints in one unit is the case the
+  // annotation cursor exists for: each offset indexes the text the blob
+  // holds, so restoring the first must not displace the second.
+  const message = {
+    role: "user",
+    content: [
+      { type: "text", text: "first", cache_control: { type: "ephemeral" } },
+      { type: "text", text: "second", cache_control: { type: "ephemeral" } },
+    ],
+  };
+  const payload = JSON.stringify({ messages: [message] });
+
+  const blobs = createBlobs();
+  const { skeleton } = blobs.store(payload, "messages", 1);
+  const unit = skeleton.find((part) => typeof part !== "string");
+  assert.ok(unit !== undefined && typeof unit !== "string");
+  assert.equal(unit.annotations.length, 2, "both breakpoints were cut");
+  assert.ok(
+    !blobs.map()[unit.blob]!.json.includes("cache_control"),
+    "and the blob is the unit without them",
+  );
+
+  const parts = reconstructParts(skeleton, (hash) => blobs.map()[hash]);
+  assert.deepEqual(parts.map((part) => part.hole), [false, false, false]);
+  assert.equal(parts.map((part) => part.text).join(""), payload);
+});
+
+test("a reference whose blob has gone reconstructs to one marked hole", () => {
+  const payload = JSON.stringify({ messages: [{ role: "user", content: "gone" }] });
+  const blobs = createBlobs();
+  const { skeleton } = blobs.store(payload, "messages", 1);
+  const [evicted] = blobs.evictTo(0);
+  assert.ok(evicted !== undefined);
+
+  const parts = reconstructParts(skeleton, (hash) => blobs.map()[hash]);
+  const holes = parts.filter((part) => part.hole);
+  assert.equal(holes.length, 1);
+  assert.equal(holes[0]!.text, evictedHole(evicted.blob));
+  assert.throws(
+    () => JSON.parse(parts.map((part) => part.text).join("")),
+    "a payload with a hole must not parse as a shorter conversation",
+  );
+});
+
+test("the rule the page receives is self-contained, and is the rule", () => {
+  // The page runs this source in a browser, where the only names in scope are
+  // the ones it brought with it. A reference from the rule to anything else in
+  // this module would type-check, build, and fail only in a viewer, so the
+  // source is run here in a context that holds nothing at all.
+  const payload = JSON.stringify({
+    messages: [{ role: "user", content: "a", cache_control: { type: "ephemeral" } }],
+  });
+  const blobs = createBlobs();
+  const { skeleton } = blobs.store(payload, "messages", 1);
+
+  const shipped = runInNewContext(
+    `${RECONSTRUCTION_SOURCE}
+    (skeleton, map) => JSON.stringify(reconstructParts(skeleton, (hash) => map[hash]));`,
+    {},
+  ) as (skeleton: Skeleton, map: BlobMap) => string;
+  const here = (map: BlobMap): string =>
+    JSON.stringify(reconstructParts(skeleton, (hash) => map[hash]));
+
+  const held = blobs.map();
+  assert.equal(shipped(skeleton, held), here(held));
+  assert.equal(JSON.parse(shipped(skeleton, held)).map((part: ReconstructedPart) => part.text).join(""), payload);
+
+  // And once the blob is gone, so that the hole a viewer shows comes from
+  // here too rather than from a spelling the page kept.
+  blobs.evictTo(0);
+  const emptied = blobs.map();
+  assert.equal(shipped(skeleton, emptied), here(emptied));
+  assert.match(shipped(skeleton, emptied), /tap evicted this unit/);
 });
 
 test("reconstruction is byte-exact through whitespace, key order and escapes", () => {

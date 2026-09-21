@@ -1,4 +1,5 @@
 import { request } from "node:http";
+import { reconstruct } from "../../src/record/blobs.ts";
 
 /**
  * The UI's HTTP endpoint as a client sees it. The snapshot is a documented
@@ -120,34 +121,17 @@ export interface Snapshot {
 }
 
 /**
- * The payload a skeleton stands for. Written out here, from the documented
- * shape alone, rather than imported from Tap: the claim under test is that a
- * reader of the snapshot can get the original bytes back, and a test that
- * called Tap's own reconstructor could not disagree with it.
+ * The payload a skeleton stands for, by Tap's own reconstruction rule.
  *
- * A reference whose blob has been evicted becomes a marked hole, which is
- * what the documented rule says a reader should put there: never nothing,
- * which would read as a shorter conversation than the one that happened.
+ * Imported rather than written out again. The shapes above are declared here
+ * on purpose — a test that borrowed the implementation's shape could not
+ * disagree with it — but reconstruction is not a shape, it is the rule the
+ * page already receives verbatim, and a third spelling of it would only
+ * assert that three copies agree.
  */
 export function payloadOf(snapshot: Snapshot, request: SnapshotRequest): string | null {
   if (request.skeleton === null) return null;
-  return request.skeleton
-    .map((part) => {
-      if (typeof part === "string") return part;
-      const held = snapshot.blobs[part.blob];
-      if (held === undefined) {
-        return `/* tap evicted this unit to stay under its cap: ${part.blob} */`;
-      }
-      const { json } = held;
-      let restored = "";
-      let cursor = 0;
-      for (const { at, text } of part.annotations) {
-        restored += json.slice(cursor, at) + text;
-        cursor = at;
-      }
-      return restored + json.slice(cursor);
-    })
-    .join("");
+  return reconstruct(request.skeleton, snapshot.blobs);
 }
 
 export interface HttpAnswer {
