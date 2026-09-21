@@ -24,7 +24,11 @@ after(() => tap.dispose());
 after(killAllSessions);
 
 /** One request as the record saw it: a payload in, the row it made out. */
-function capture(record: RecordHandle, payload: string, path = "/v1/messages"): RecordedRequest {
+function attributed(
+  record: RecordHandle,
+  payload: string,
+  path = "/v1/messages",
+): RecordedRequest {
   const entry = record.begin("POST", path);
   entry.observePayload(payload);
   return record.snapshot().requests[entry.seq - 1]!;
@@ -41,10 +45,10 @@ test("a request continuing a conversation is in the thread the conversation is",
   const record = createRecord();
   const [one, two, three] = [message("one"), message("two"), message("three")];
 
-  assert.equal(capture(record, ask(one)).thread, 1);
-  assert.equal(capture(record, ask(one, two)).thread, 1);
+  assert.equal(attributed(record, ask(one)).thread, 1);
+  assert.equal(attributed(record, ask(one, two)).thread, 1);
   assert.equal(
-    capture(record, ask(one, two, three)).thread,
+    attributed(record, ask(one, two, three)).thread,
     1,
     "the conversation grows and stays itself",
   );
@@ -56,10 +60,10 @@ test("a request whose prefix has never been seen opens a thread of its own", () 
   const main = [message("prompt"), message("answer")];
   const other = [message("another opening")];
 
-  assert.equal(capture(record, ask(...main)).thread, 1);
-  assert.equal(capture(record, ask(...other)).thread, 2, "nothing shared, so nothing continued");
-  assert.equal(capture(record, ask(...main, message("next"))).thread, 1);
-  assert.equal(capture(record, ask(...other, message("another answer"))).thread, 2);
+  assert.equal(attributed(record, ask(...main)).thread, 1);
+  assert.equal(attributed(record, ask(...other)).thread, 2, "nothing shared, so nothing continued");
+  assert.equal(attributed(record, ask(...main, message("next"))).thread, 1);
+  assert.equal(attributed(record, ask(...other, message("another answer"))).thread, 2);
 
   assert.deepEqual(record.snapshot().threads, [
     { id: 1, main: true, firstSeq: 1 },
@@ -69,9 +73,9 @@ test("a request whose prefix has never been seen opens a thread of its own", () 
 
 test("the first thread of a session is the main one, and only the first", () => {
   const record = createRecord();
-  capture(record, ask(message("first")));
-  capture(record, ask(message("second")));
-  capture(record, ask(message("third")));
+  attributed(record, ask(message("first")));
+  attributed(record, ask(message("second")));
+  attributed(record, ask(message("third")));
 
   assert.deepEqual(
     record.snapshot().threads.map((thread) => thread.main),
@@ -81,8 +85,8 @@ test("the first thread of a session is the main one, and only the first", () => 
 
 test("a thread is never told what it is, only which one it is", () => {
   const record = createRecord();
-  capture(record, ask(message("prompt")));
-  capture(record, ask(message("another opening")));
+  attributed(record, ask(message("prompt")));
+  attributed(record, ask(message("another opening")));
 
   // The wire cannot tell a subagent from a `/clear`, a `--resume` or a
   // compaction, so nothing here may claim to have. A thread carries a number,
@@ -103,15 +107,15 @@ test("attribution does not depend on the order interleaved requests are assigned
   const conversation = [message("one"), message("two"), message("three")];
 
   const inOrder = createRecord();
-  assert.equal(capture(inOrder, ask(...conversation.slice(0, 1))).thread, 1);
-  assert.equal(capture(inOrder, ask(message("elsewhere"))).thread, 2);
-  assert.equal(capture(inOrder, ask(...conversation)).thread, 1);
+  assert.equal(attributed(inOrder, ask(...conversation.slice(0, 1))).thread, 1);
+  assert.equal(attributed(inOrder, ask(message("elsewhere"))).thread, 2);
+  assert.equal(attributed(inOrder, ask(...conversation)).thread, 1);
 
   const overtaken = createRecord();
-  assert.equal(capture(overtaken, ask(...conversation)).thread, 1);
-  assert.equal(capture(overtaken, ask(message("elsewhere"))).thread, 2);
+  assert.equal(attributed(overtaken, ask(...conversation)).thread, 1);
+  assert.equal(attributed(overtaken, ask(message("elsewhere"))).thread, 2);
   assert.equal(
-    capture(overtaken, ask(...conversation.slice(0, 1))).thread,
+    attributed(overtaken, ask(...conversation.slice(0, 1))).thread,
     1,
     "the short request is the long one's prefix however late it is assigned",
   );
@@ -123,11 +127,11 @@ test("the longest prefix a request shares is the thread it belongs to", () => {
   // to that one rather than to whichever was seen first.
   const record = createRecord();
   const opening = message("identical opening");
-  assert.equal(capture(record, ask(opening)).thread, 1);
-  assert.equal(capture(record, ask(opening, message("this way"))).thread, 1);
-  assert.equal(capture(record, ask(opening, message("that way"))).thread, 1);
+  assert.equal(attributed(record, ask(opening)).thread, 1);
+  assert.equal(attributed(record, ask(opening, message("this way"))).thread, 1);
+  assert.equal(attributed(record, ask(opening, message("that way"))).thread, 1);
   assert.equal(
-    capture(record, ask(opening, message("that way"), message("onwards"))).thread,
+    attributed(record, ask(opening, message("that way"), message("onwards"))).thread,
     1,
     "shared prefixes are one thread; the wire does not say they are two",
   );
@@ -136,15 +140,15 @@ test("the longest prefix a request shares is the thread it belongs to", () => {
 test("a request with no messages is attributed to nothing rather than to the main thread", () => {
   const record = createRecord();
   assert.equal(
-    capture(record, JSON.stringify({ model: "claude-opus-5" })).thread,
+    attributed(record, JSON.stringify({ model: "claude-opus-5" })).thread,
     null,
     "there is no prefix to derive a lineage from",
   );
   assert.deepEqual(record.snapshot().threads, [], "and nothing was opened by asking");
 
-  assert.equal(capture(record, ask(message("prompt"))).thread, 1);
+  assert.equal(attributed(record, ask(message("prompt"))).thread, 1);
   assert.equal(
-    capture(record, JSON.stringify({ model: "claude-opus-5" })).thread,
+    attributed(record, JSON.stringify({ model: "claude-opus-5" })).thread,
     null,
     "a request with no messages joins no thread, however many are open",
   );
@@ -154,8 +158,8 @@ test("a request Tap cannot read at all is attributed to nothing", () => {
   // An `other` request is never taken apart, so it has no messages to derive
   // a lineage from however much conversation is in its body.
   const record = createRecord();
-  capture(record, ask(message("prompt")));
-  assert.equal(capture(record, ask(message("prompt")), "/v1/models").thread, null);
+  attributed(record, ask(message("prompt")));
+  assert.equal(attributed(record, ask(message("prompt")), "/v1/models").thread, null);
   assert.deepEqual(record.snapshot().threads.length, 1, "and it opened nothing");
 });
 
@@ -165,10 +169,10 @@ test("history rewritten in place forks a thread, which is the honest answer", ()
   // accepted artefact rather than something to guess around.
   const record = createRecord();
   assert.equal(
-    capture(record, ask(message("one"), message("two"), message("three"))).thread,
+    attributed(record, ask(message("one"), message("two"), message("three"))).thread,
     1,
   );
-  assert.equal(capture(record, ask(message("summary of one to three"))).thread, 2);
+  assert.equal(attributed(record, ask(message("summary of one to three"))).thread, 2);
   assert.deepEqual(
     record.snapshot().threads.map((thread) => thread.firstSeq),
     [1, 2],

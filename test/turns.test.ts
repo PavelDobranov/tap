@@ -57,6 +57,9 @@ function attributed(
   return record.snapshot().requests[entry.seq - 1]!;
 }
 
+/** Where a request belongs: which lineage, and which turn of it. */
+const placeOf = (request: RecordedRequest): (number | null)[] => [request.thread, request.turn];
+
 /**
  * A conversation on the wire: each call adds a message and sends everything
  * said so far, which is what Claude Code does and what both derivations read.
@@ -118,39 +121,36 @@ test("turns are derived inside a thread and numbered in first-seen order there",
   const main = conversation(record);
   const elsewhere = conversation(record);
 
-  assert.deepEqual(rowOf(main(prompt("main one"))), [1, 1]);
+  assert.deepEqual(placeOf(main(prompt("main one"))), [1, 1]);
   assert.deepEqual(
-    rowOf(elsewhere(prompt("elsewhere one"))),
+    placeOf(elsewhere(prompt("elsewhere one"))),
     [2, 1],
     "a thread counts from its own 1",
   );
-  assert.deepEqual(rowOf(main(toolResult("toolu_main"))), [1, 1]);
-  assert.deepEqual(rowOf(elsewhere(prompt("elsewhere two"))), [2, 2]);
+  assert.deepEqual(placeOf(main(toolResult("toolu_main"))), [1, 1]);
+  assert.deepEqual(placeOf(elsewhere(prompt("elsewhere two"))), [2, 2]);
   assert.deepEqual(
-    rowOf(main(prompt("main two"))),
+    placeOf(main(prompt("main two"))),
     [1, 2],
     "and is unmoved by the other thread",
   );
 });
 
-/** The pair a row is read for here: which lineage, and which turn of it. */
-const rowOf = (request: RecordedRequest): (number | null)[] => [request.thread, request.turn];
-
 test("a request with no thread to derive a turn in is left ungrouped", () => {
   const record = createRecord();
 
   assert.deepEqual(
-    rowOf(attributed(record, JSON.stringify({ model: "claude-opus-5" }))),
+    placeOf(attributed(record, JSON.stringify({ model: "claude-opus-5" }))),
     [null, null],
     "no messages, so no conversation to be a turn of",
   );
   assert.deepEqual(
-    rowOf(attributed(record, ask(prompt("nowhere")), "/v1/models")),
+    placeOf(attributed(record, ask(prompt("nowhere")), "/v1/models")),
     [null, null],
     "and a request Tap does not read as conversation is not one either",
   );
   assert.deepEqual(
-    rowOf(attributed(record, ask(prompt("somewhere")))),
+    placeOf(attributed(record, ask(prompt("somewhere")))),
     [1, 1],
     "neither of which opened a turn",
   );
@@ -164,14 +164,14 @@ test("a count_tokens request keeps its thread and never advances its turn", () =
   const first = prompt("read the file");
   const second = prompt("now change it");
 
-  assert.deepEqual(rowOf(attributed(record, ask(first))), [1, 1]);
+  assert.deepEqual(placeOf(attributed(record, ask(first))), [1, 1]);
   assert.deepEqual(
-    rowOf(attributed(record, ask(first, second), "/v1/messages/count_tokens")),
+    placeOf(attributed(record, ask(first, second), "/v1/messages/count_tokens")),
     [1, null],
     "the same lineage, and no turn of it",
   );
   assert.deepEqual(
-    rowOf(attributed(record, ask(first, second))),
+    placeOf(attributed(record, ask(first, second))),
     [1, 2],
     "and the prompt it was asked about is still the thread's second turn",
   );
@@ -185,11 +185,11 @@ test("a request that opens a thread takes the first turn of that thread", () => 
   const record = createRecord();
   const main = conversation(record);
 
-  assert.deepEqual(rowOf(main(prompt("read the file"))), [1, 1]);
-  assert.deepEqual(rowOf(main(toolResult("toolu_read"))), [1, 1]);
-  assert.deepEqual(rowOf(attributed(record, ask(prompt("read the file, elsewhere")))), [2, 1]);
+  assert.deepEqual(placeOf(main(prompt("read the file"))), [1, 1]);
+  assert.deepEqual(placeOf(main(toolResult("toolu_read"))), [1, 1]);
+  assert.deepEqual(placeOf(attributed(record, ask(prompt("read the file, elsewhere")))), [2, 1]);
   assert.deepEqual(
-    rowOf(main(prompt("now change it"))),
+    placeOf(main(prompt("now change it"))),
     [1, 2],
     "and the thread that was interrupted counts on from where it was",
   );
@@ -210,18 +210,18 @@ test("a thread that is first seen mid-loop starts at its first request rather th
 test("a final message that cannot be read as one continues the turn rather than opening one", () => {
   const record = createRecord();
   const messages: unknown[] = [prompt("first")];
-  assert.deepEqual(rowOf(attributed(record, ask(...messages))), [1, 1]);
+  assert.deepEqual(placeOf(attributed(record, ask(...messages))), [1, 1]);
 
   // Not JSON at all. The payload is scanned for where its messages are rather
   // than parsed, so a message-shaped span that will not parse still arrives
   // here — and says nothing about a boundary.
   const malformed = `{"model":"claude-opus-5","messages":[${JSON.stringify(messages[0])},nope]}`;
-  assert.deepEqual(rowOf(attributed(record, malformed)), [1, 1]);
+  assert.deepEqual(placeOf(attributed(record, malformed)), [1, 1]);
 
   messages.push("a string, not a message");
-  assert.deepEqual(rowOf(attributed(record, ask(...messages))), [1, 1]);
+  assert.deepEqual(placeOf(attributed(record, ask(...messages))), [1, 1]);
   messages.push({ content: "no role" });
-  assert.deepEqual(rowOf(attributed(record, ask(...messages))), [1, 1]);
+  assert.deepEqual(placeOf(attributed(record, ask(...messages))), [1, 1]);
 });
 
 test("a session's turns are derived from the conversation and served in the snapshot", async () => {

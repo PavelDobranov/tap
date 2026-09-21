@@ -673,8 +673,9 @@ function createAttribution(): Attribution {
       const thread = lineageOf(seq, stored.messageAddresses);
       if (thread === null) return { thread, turn: null };
 
-      // Only conversation is counted into turns, and this is the only place
-      // the exclusion is written because it is the only place it is applied.
+      // Only conversation is counted into turns, and the exclusion is
+      // written here because here is where it is applied — one condition
+      // rather than a rule in one module and its enforcement in another.
       // A `count_tokens` request repeats a thread's messages to ask what they
       // cost, which is not work the prompt set off, and giving it a turn
       // would inflate every count a divider shows; an `other` request is one

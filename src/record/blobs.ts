@@ -97,7 +97,8 @@ export interface Stored {
    *
    * A slice of the payload rather than a copy of it, which is what makes
    * handing it over free and what the rule for using it is stated in terms
-   * of; that rule sits with the code that reads it.
+   * of. That rule is stated by `createAttribution`, in `record.ts`, which is
+   * what reads it.
    */
   readonly finalMessage: string | null;
 }
@@ -278,8 +279,7 @@ export function createBlobs(): Blobs {
         skeleton: parts,
         messageAddresses,
         // Not detached, unlike everything the record keeps: this is handed
-        // over to be read, and what may be done with a slice is stated where
-        // it is read.
+        // over to be read, under the rule `createAttribution` states.
         finalMessage: finalMessage === null ? null : payload.slice(finalMessage.from, finalMessage.to),
         additions,
       };
