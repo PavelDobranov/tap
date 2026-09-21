@@ -24,6 +24,11 @@ const TOKEN_COOKIE = "tap_token";
  * bytes sit above the socket, and it lives only until the snapshot is out.
  * Outside that window nothing is queued above the socket at all. Reaching the
  * ceiling either way disposes that viewer and no other.
+ *
+ * It also paces the snapshot route, which serves a reader rather than a
+ * viewer and so is never disposed: there it is how much may be outstanding
+ * before the writer waits for the socket. One number, because what it
+ * measures — bytes a socket has not taken — is the same on both routes.
  */
 const VIEWER_BACKLOG_LIMIT = 1024 * 1024;
 
@@ -124,7 +129,7 @@ async function answer(req: IncomingMessage, res: ServerResponse, served: Served)
       return;
     case "/api/snapshot":
       res.writeHead(200, headers);
-      await writeSnapshot(res, served.record.snapshot());
+      await writeSnapshot(new SnapshotWriter(res), served.record.snapshot());
       res.end();
       return;
     case "/api/events":
@@ -232,41 +237,109 @@ async function streamEvents(res: ServerResponse, record: Record): Promise<void> 
 }
 
 function frame(event: string, revision: number, data: unknown): string {
-  return `event: ${event}\nid: ${revision}\ndata: ${JSON.stringify(data)}\n\n`;
+  return `${frameHead(event, revision)}${JSON.stringify(data)}${FRAME_END}`;
 }
 
 /**
- * Writes the opening snapshot in small pieces, letting the socket fill and
- * waiting for it only once it is genuinely full, rather than giving up on the
- * first piece that passes the high-water mark: a snapshot is the one thing a
- * viewer cannot do without, and a record big enough to fill a socket is
- * exactly the record worth opening the UI on. Yielding between pieces is what
- * keeps serving it off the path a request crosses.
+ * The envelope of a framed event, up to the start of its data. Written on its
+ * own by the opening frame, whose data is too big to be a string before it is
+ * a frame, so that both spellings of an event's envelope are this one.
+ */
+function frameHead(event: string, revision: number): string {
+  return `event: ${event}\nid: ${revision}\ndata: `;
+}
+
+/** A framed event ends at a blank line, which is what closes its data line. */
+const FRAME_END = "\n\n";
+
+/**
+ * Writes the opening frame the same way the snapshot route writes its body:
+ * serialised as it goes, never stringified whole. The frame is the snapshot
+ * plus a few bytes of envelope, so building it as one string and slicing the
+ * result meant holding the entire record in memory before a byte of it went
+ * out — on the one route every real viewer takes, and on exactly the records
+ * big enough for that to matter.
+ *
+ * Nothing in the snapshot's JSON is a raw newline, so the data line is one
+ * line however many pieces it takes to write.
  */
 async function writeOpeningFrame(res: ServerResponse, snapshot: Snapshot): Promise<boolean> {
-  const text = frame("snapshot", snapshot.revision, { revision: snapshot.revision, snapshot });
-  const piece = 8 * 1024;
-  for (let at = 0; at < text.length; at += piece) {
-    if (res.destroyed || res.writableEnded) return false;
-    res.write(text.slice(at, at + piece));
-    // Waiting on every piece would put a round trip between each of them and
-    // serve a large record at a crawl. Waiting only once the socket is
-    // genuinely full keeps the outstanding bytes bounded by the same ceiling a
-    // live viewer is held to, which is the whole of what this connection costs.
-    if (res.writableLength > VIEWER_BACKLOG_LIMIT && !(await drained(res))) return false;
-    // Only between pieces: a yield after the last one buys nothing and widens
-    // the window in which a viewer that already has the whole snapshot is
-    // disposed for a delta it could simply have been sent.
-    if (at + piece < text.length) await yieldToOtherRequests();
+  const writer = new SnapshotWriter(res);
+  try {
+    await writer.write(
+      `${frameHead("snapshot", snapshot.revision)}{"revision":${snapshot.revision},"snapshot":`,
+    );
+    await writeSnapshot(writer, snapshot);
+    await writer.write(`}${FRAME_END}`);
+  } catch (error) {
+    if (error instanceof ResponseClosed) return false;
+    throw error;
   }
   return true;
 }
 
 /**
+ * The one way a snapshot reaches a socket, and the one rule for when to wait.
+ * Whether it is a viewer's opening frame or the snapshot route's body, the
+ * bytes are paced the same way.
+ *
+ * Pieces are pushed until the socket is holding more than a stalled viewer
+ * would be allowed to hold, and only then is the socket waited on: waiting on
+ * every piece would put a round trip between each of them and serve a large
+ * record at a crawl, while giving up on the first piece past the high-water
+ * mark would refuse the records the UI exists for. What is outstanding stays
+ * bounded by the same ceiling a live viewer is held to, which is the whole of
+ * what one connection costs.
+ *
+ * Both snapshot routes write through this, so neither can grow a backpressure
+ * rule of its own, and yielding between pieces — whatever the route — is what
+ * keeps serving a large record off the path a request crosses.
+ */
+class SnapshotWriter {
+  readonly #res: ServerResponse;
+  /** Bytes written since the last yield: what the next one waits for. */
+  #unyielded = 0;
+
+  constructor(res: ServerResponse) {
+    this.#res = res;
+  }
+
+  /** Throws `ResponseClosed` if the viewer went away mid-snapshot. */
+  async write(piece: string): Promise<void> {
+    // Yields are spaced by bytes, not by pieces. A snapshot is written in
+    // whatever pieces its shape has — a whole request, a separating comma —
+    // so yielding on every one would tie the number of event-loop turns to
+    // the number of elements, and a record of many small requests would pay
+    // two turns each to write a few bytes. What a yield is for is the size of
+    // the work between them, which is bytes.
+    //
+    // Before the piece rather than after it: a yield past the last one buys
+    // nothing and widens the window in which a viewer that already has the
+    // whole snapshot is disposed for a delta it could simply have been sent.
+    if (this.#unyielded >= YIELD_EVERY) {
+      this.#unyielded = 0;
+      await yieldToOtherRequests();
+    }
+    if (this.#res.destroyed || this.#res.writableEnded) throw new ResponseClosed();
+    this.#res.write(piece);
+    this.#unyielded += Buffer.byteLength(piece);
+    if (this.#res.writableLength > VIEWER_BACKLOG_LIMIT && !(await drained(this.#res))) {
+      throw new ResponseClosed();
+    }
+  }
+}
+
+/**
+ * How much of a snapshot goes out between yields. Small enough that nothing
+ * else waits a perceptible time behind it — capture is on the same event loop
+ * and must never be delayed by a viewer — and large enough that a big record
+ * does not cross the loop thousands of times to be served.
+ */
+const YIELD_EVERY = 8 * 1024;
+
+/**
  * Resolves once the socket has caught up, or false if it went away first.
- * The one place that waits on a socket: both the snapshot routes push until
- * the socket is full and then come here, and they differ only in how they say
- * a viewer has gone.
+ * The one place that waits on a socket.
  */
 function drained(res: ServerResponse): Promise<boolean> {
   return new Promise((resolve) => {
@@ -293,53 +366,47 @@ function refuse(res: ServerResponse, status: number, reason: string): void {
   res.end(`tap: ${reason}\n`);
 }
 
-/** Streams a JSON snapshot in record-order pieces, yielding between unbounded lists. */
-async function writeSnapshot(res: ServerResponse, snapshot: Snapshot): Promise<void> {
-  await writeChunk(res, `{"revision":${snapshot.revision},"lifecycle":${JSON.stringify(snapshot.lifecycle)},"requests":`);
-  await writeArray(res, snapshot.requests);
-  await writeChunk(res, ',"threads":');
-  await writeArray(res, snapshot.threads);
-  await writeChunk(res, ',"blobs":');
-  await writeBlobMap(res, snapshot.blobs);
-  await writeChunk(res, ',"storage":');
-  await writeChunk(res, JSON.stringify(snapshot.storage));
-  await writeChunk(res, ',"evictions":');
-  await writeArray(res, snapshot.evictions);
-  await writeChunk(res, ',"diagnostics":');
-  await writeArray(res, snapshot.diagnostics);
-  await writeChunk(res, "}");
+/** Streams a JSON snapshot in record-order pieces, one element at a time. */
+async function writeSnapshot(writer: SnapshotWriter, snapshot: Snapshot): Promise<void> {
+  await writer.write(
+    `{"revision":${snapshot.revision},"lifecycle":${JSON.stringify(snapshot.lifecycle)},"requests":`,
+  );
+  await writeArray(writer, snapshot.requests);
+  await writer.write(',"threads":');
+  await writeArray(writer, snapshot.threads);
+  await writer.write(',"blobs":');
+  await writeBlobMap(writer, snapshot.blobs);
+  await writer.write(',"storage":');
+  await writer.write(JSON.stringify(snapshot.storage));
+  await writer.write(',"evictions":');
+  await writeArray(writer, snapshot.evictions);
+  await writer.write(',"diagnostics":');
+  await writeArray(writer, snapshot.diagnostics);
+  await writer.write("}");
 }
 
-async function writeArray(res: ServerResponse, values: readonly unknown[]): Promise<void> {
-  await writeChunk(res, "[");
+async function writeArray(writer: SnapshotWriter, values: readonly unknown[]): Promise<void> {
+  await writer.write("[");
   for (const [index, value] of values.entries()) {
-    if (index > 0) await writeChunk(res, ",");
-    await writeChunk(res, JSON.stringify(value));
-    await yieldToOtherRequests();
+    if (index > 0) await writer.write(",");
+    await writer.write(JSON.stringify(value));
   }
-  await writeChunk(res, "]");
+  await writer.write("]");
 }
 
-async function writeBlobMap(res: ServerResponse, blobs: Snapshot["blobs"]): Promise<void> {
-  await writeChunk(res, "{");
+async function writeBlobMap(writer: SnapshotWriter, blobs: Snapshot["blobs"]): Promise<void> {
+  await writer.write("{");
   let first = true;
   for (const [hash, blob] of Object.entries(blobs)) {
-    if (!first) await writeChunk(res, ",");
+    if (!first) await writer.write(",");
     first = false;
-    await writeChunk(res, `${JSON.stringify(hash)}:${JSON.stringify(blob)}`);
-    await yieldToOtherRequests();
+    await writer.write(`${JSON.stringify(hash)}:${JSON.stringify(blob)}`);
   }
-  await writeChunk(res, "}");
+  await writer.write("}");
 }
 
 function yieldToOtherRequests(): Promise<void> {
   return new Promise((resolve) => setImmediate(resolve));
-}
-
-async function writeChunk(res: ServerResponse, chunk: string): Promise<void> {
-  if (res.destroyed || res.writableEnded) throw new ResponseClosed();
-  if (res.write(chunk)) return;
-  if (!(await drained(res))) throw new ResponseClosed();
 }
 
 class ResponseClosed extends Error {}

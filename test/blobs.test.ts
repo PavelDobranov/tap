@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { runInNewContext } from "node:vm";
-import { setFlagsFromString } from "node:v8";
+import { collectGarbage } from "./helpers/heap.ts";
 import { canonicalJson } from "../src/record/canonical.ts";
 import {
   createBlobs,
@@ -304,9 +304,6 @@ test("a stored blob does not keep the payload it was read out of alive", () => {
   // record goes on holding every payload in full while reporting a
   // deduplication it is not getting. Measured, because no assertion about the
   // shape of a skeleton can see it.
-  setFlagsFromString("--expose-gc");
-  const collect = runInNewContext("gc") as () => void;
-
   const blobs = createBlobs();
   // A megabyte of system block, resent unchanged by every one of fifty
   // requests: one blob, and fifty megabytes of payload that must not survive
@@ -320,7 +317,7 @@ test("a stored blob does not keep the payload it was read out of alive", () => {
   const { payloadSize } = blobs.storage();
   assert.ok(payloadSize < 2 * 1024 * 1024, `the record says it holds ${payloadSize} bytes`);
 
-  collect();
+  collectGarbage();
   const held = process.memoryUsage().heapUsed;
   assert.ok(
     held < 20 * 1024 * 1024,

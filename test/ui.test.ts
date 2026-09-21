@@ -9,6 +9,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { openUi } from "./helpers/browser.ts";
 import { createFakeAgent } from "./helpers/fake-agent.ts";
+import { collectGarbage } from "./helpers/heap.ts";
 import { freePort, killAllSessions, startTap, type TapSession } from "./helpers/run-tap.ts";
 import { createProber, quit } from "./helpers/session.ts";
 import { ask, printedUrl, snapshotAt } from "./helpers/snapshot.ts";
@@ -114,13 +115,32 @@ function openEvents(url: string): Promise<SseViewer> {
       assert.equal(response.statusCode, 200);
       response.setEncoding("utf8");
       let disturb: (() => void) | null = null;
-      let buffered = "";
-      // Where the last search for a frame boundary gave up. Without it, a
-      // snapshot of any size is rescanned from the start on every chunk, which
-      // is quadratic in exactly the case worth testing.
-      let searched = 0;
+      // The frame being read, kept as the chunks it arrived in. Appending to
+      // one string and searching that string again on every chunk reflattens
+      // everything received so far each time, which is quadratic in exactly
+      // the case worth testing: an opening frame of tens of megabytes.
+      const pending: string[] = [];
+      // The last character of the previous chunk, held back so a boundary
+      // split across two chunks is still found. Never in `pending`.
+      let carry = "";
       const messages: SseMessage[] = [];
       const waiting: ((message: SseMessage) => void)[] = [];
+      const deliver = (text: string): void => {
+        const fields = Object.fromEntries(
+          text.split("\n").map((line) => {
+            const colon = line.indexOf(":");
+            return [line.slice(0, colon), line.slice(colon + 1).trimStart()];
+          }),
+        );
+        const message = {
+          event: fields.event ?? "message",
+          id: Number(fields.id),
+          data: JSON.parse(fields.data ?? "null") as unknown,
+        };
+        const receive = waiting.shift();
+        if (receive === undefined) messages.push(message);
+        else receive(message);
+      };
       response.on("data", (chunk: string) => {
         // Fired once, on the first bytes of the opening frame: the only moment
         // at which a test can put the record and the snapshot in a race.
@@ -129,31 +149,19 @@ function openEvents(url: string): Promise<SseViewer> {
           disturb = null;
           act();
         }
-        buffered += chunk;
+        let rest = carry + chunk;
+        carry = "";
         for (;;) {
-          const boundary = buffered.indexOf("\n\n", searched);
-          if (boundary < 0) {
-            searched = Math.max(0, buffered.length - 1);
-            break;
-          }
-          const frame = buffered.slice(0, boundary);
-          buffered = buffered.slice(boundary + 2);
-          searched = 0;
-          const fields = Object.fromEntries(
-            frame.split("\n").map((line) => {
-              const colon = line.indexOf(":");
-              return [line.slice(0, colon), line.slice(colon + 1).trimStart()];
-            }),
-          );
-          const message = {
-            event: fields.event ?? "message",
-            id: Number(fields.id),
-            data: JSON.parse(fields.data ?? "null") as unknown,
-          };
-          const receive = waiting.shift();
-          if (receive === undefined) messages.push(message);
-          else receive(message);
+          const boundary = rest.indexOf("\n\n");
+          if (boundary < 0) break;
+          pending.push(rest.slice(0, boundary));
+          const text = pending.join("");
+          pending.length = 0;
+          rest = rest.slice(boundary + 2);
+          deliver(text);
         }
+        carry = rest.slice(-1);
+        pending.push(rest.slice(0, rest.length - carry.length));
       });
       resolve({
         disturb: (act: () => void) => {
@@ -397,7 +405,9 @@ test("a viewer under backpressure is disposable and a later viewer gets a fresh 
 });
 
 
-test("serving a large snapshot yields often enough for forwarding to keep running", async () => {
+test("serving a large opening frame yields often enough for forwarding to keep running", async () => {
+  // Through the route a viewer actually takes: the opening frame of a live
+  // connection, not the dedicated snapshot endpoint the test helper reads.
   const record = largeRecord();
   const ui = await startUi(record, await freePort());
   const upstream = await startFakeUpstream({
@@ -412,25 +422,110 @@ test("serving a large snapshot yields often enough for forwarding to keep runnin
     },
   });
   const proxy = await startProxy(new URL(upstream.baseUrl), createCapture(record));
+  let viewer: SseViewer | null = null;
 
   try {
     const streamed = readThroughProxy(proxy.baseUrl);
     await streamed.firstChunk;
-    const snapshot = snapshotAt(ui.url);
+    viewer = await openEvents(ui.url);
+    const opening = viewer.next();
     const gaps = await streamed.gaps;
 
-    assert.ok((await snapshot).requests.length >= 400);
+    const frame = await opening;
+    assert.equal(frame.event, "snapshot");
+    const { snapshot } = frame.data as { snapshot: { requests: unknown[] } };
+    assert.ok(snapshot.requests.length >= 400);
     assert.ok(gaps.length >= 2, "the agent should receive the upstream response as chunks");
     assert.ok(
       gaps[0]! < 125,
-      `serving the snapshot delayed the next forwarded chunk by ${gaps[0]!.toFixed(1)}ms`,
+      `serving the opening frame delayed the next forwarded chunk by ${gaps[0]!.toFixed(1)}ms`,
     );
   } finally {
+    viewer?.close();
     await proxy.close();
     await upstream.close();
     await ui.close();
   }
 });
+
+test("serving an opening frame holds nothing the size of the record", async () => {
+  // Stringifying the snapshot whole and slicing the result holds every byte
+  // of the record before one goes out, so peak hold tracks the record and a
+  // record past the string cap cannot be opened at all. Built incrementally,
+  // what is held at once is one element, whatever the record.
+  const record = largeRecord();
+  const ui = await startUi(record, await freePort());
+
+  try {
+    const settled = retainedHeap();
+    const opened = await drainOpeningFrame(ui.url);
+    const held = (opened.peakHeap - settled) / (1024 * 1024);
+    const frame = opened.bytes / (1024 * 1024);
+    // A fixed ceiling rather than a fraction of the frame, because the claim
+    // is that peak hold does not scale: one element of this record plus the
+    // socket's own ceiling, with room to spare. Measured at 0.7 MiB here,
+    // against 51 MiB when the frame was stringified whole.
+    const bound = 4;
+    assert.ok(frame > 40, `the record serialised to only ${frame.toFixed(1)} MiB`);
+    assert.ok(
+      held < bound,
+      `serving a ${frame.toFixed(1)} MiB frame held ${held.toFixed(1)} MiB, over ${bound} MiB`,
+    );
+  } finally {
+    await ui.close();
+  }
+});
+
+/** What the process is still holding, rather than what it has allocated. */
+function retainedHeap(): number {
+  collectGarbage();
+  return process.memoryUsage().heapUsed;
+}
+
+/**
+ * Reads one opening frame without keeping it — the size of the frame is the
+ * subject here, so a reader that buffered it would be measuring itself —
+ * sampling what the server still holds as the bytes go by.
+ */
+function drainOpeningFrame(url: string): Promise<{ bytes: number; peakHeap: number }> {
+  const target = new URL(url);
+  target.pathname = "/api/events";
+  // Often enough that a hold lasting a fraction of the frame is still seen,
+  // rarely enough that collecting between samples does not dominate the read.
+  const sampleEvery = 8 * 1024 * 1024;
+  return new Promise((resolve, reject) => {
+    const req = httpRequest(target, { headers: { accept: "text/event-stream" } });
+    req.once("error", reject);
+    req.once("response", (response) => {
+      assert.equal(response.statusCode, 200);
+      let bytes = 0;
+      let sampled = 0;
+      let peakHeap = 0;
+      // The last byte of the previous chunk, so a boundary split across two
+      // chunks is still found.
+      let carry = "";
+      const done = () => resolve({ bytes, peakHeap });
+      response.on("data", (chunk: Buffer) => {
+        bytes += chunk.length;
+        if (bytes - sampled >= sampleEvery) {
+          sampled = bytes;
+          peakHeap = Math.max(peakHeap, retainedHeap());
+        }
+        // The frame ends at the first blank line: the snapshot's JSON carries
+        // no raw newline, wherever in a chunk the boundary lands.
+        const text = carry + chunk.toString("latin1");
+        carry = text.slice(-1);
+        if (!text.includes("\n\n")) return;
+        peakHeap = Math.max(peakHeap, retainedHeap());
+        response.destroy();
+        req.destroy();
+        done();
+      });
+      response.on("end", done);
+    });
+    req.end();
+  });
+}
 
 test("the UI port is fixed by default and separate from the proxy's", async () => {
   const session = startTap(["launch", "claude"], { env: { PATH: agent.pathEnv } });
