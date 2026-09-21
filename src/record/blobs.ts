@@ -95,9 +95,9 @@ export interface Stored {
    * breakpoint cannot change whose message it is or whether a tool result is
    * in it, so cutting them here would cost a pass and buy nothing.
    *
-   * To be read and dropped, never held: it is a slice of the payload, so
-   * anything that keeps it keeps the whole payload alive — the failure
-   * `detach` exists to stop.
+   * A slice of the payload rather than a copy of it, which is what makes
+   * handing it over free and what the rule for using it is stated in terms
+   * of; that rule sits with the code that reads it.
    */
   readonly finalMessage: string | null;
 }
@@ -277,8 +277,9 @@ export function createBlobs(): Blobs {
       return {
         skeleton: parts,
         messageAddresses,
-        // Not detached: this is read once, by the caller, and dropped. It is
-        // never held, so it cannot pin the payload it is a slice of.
+        // Not detached, unlike everything the record keeps: this is handed
+        // over to be read, and what may be done with a slice is stated where
+        // it is read.
         finalMessage: finalMessage === null ? null : payload.slice(finalMessage.from, finalMessage.to),
         additions,
       };

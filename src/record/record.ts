@@ -5,10 +5,10 @@ import {
   type Eviction as BlobEviction,
   type PayloadStorage,
   type Skeleton,
+  type Stored,
 } from "./blobs.ts";
 import type { AgentExit } from "../agent/run.ts";
-import { createThreads, type Thread } from "./threads.ts";
-import { createTurns } from "./turns.ts";
+import { createHash } from "node:crypto";
 
 /**
  * Re-exported so that a reader of the record does not have to reach into the
@@ -33,7 +33,19 @@ export {
   type UnitReference,
 } from "./blobs.ts";
 
-export type { Thread } from "./threads.ts";
+/** One conversation lineage seen in a Tap session. */
+export interface Thread {
+  /** Numbered from 1, in order of first appearance. */
+  readonly id: number;
+  /**
+   * Whether this is the first thread of the Tap session: the main thread, and
+   * the default thing to read. It is the one thing about a thread the wire
+   * does establish, because "first seen" needs no inference.
+   */
+  readonly main: boolean;
+  /** The request that opened it. */
+  readonly firstSeq: number;
+}
 
 /**
  * What a request was recognised as. Every request that reaches the proxy gets
@@ -91,7 +103,7 @@ export interface RecordedRequest {
    *
    * An inference, and a deliberately thin one: it says this request shares a
    * message prefix with the others in its thread, and nothing about why a
-   * thread began. See `threads.ts`.
+   * thread began. See `createAttribution` below.
    */
   readonly thread: number | null;
   /**
@@ -102,8 +114,8 @@ export interface RecordedRequest {
    *
    * An inference on top of an inference, and a weaker one than the thread it
    * sits in: it says this request looks like part of the work one prompt set
-   * off. See `turns.ts` for what it cannot see. A reader may switch it off;
-   * nothing else in the record depends on it.
+   * off. See `createAttribution` below for what it cannot see. A reader may
+   * switch it off; nothing else in the record depends on it.
    */
   readonly turn: number | null;
   readonly method: string;
@@ -361,8 +373,7 @@ export function createRecord(options: RecordOptions = {}): Record {
   const diagnostics: Diagnostic[] = [];
   const evictions: Eviction[] = [];
   const blobs = createBlobs();
-  const threads = createThreads();
-  const turns = createTurns();
+  const attribution = createAttribution();
   /** Counted as events arrive, so a snapshot never re-measures the record. */
   let responseSize = 0;
   let revision = 0;
@@ -453,18 +464,12 @@ export function createRecord(options: RecordOptions = {}): Record {
         observeModel: (model) => amend({ model }, { model }),
         observePayload: (payload) => {
           const stored = blobs.store(payload, type, seq);
-          // Attributed from the payload that was held, so the prefix a thread
-          // is derived from is the prefix the record can show.
           for (const [hash, blob] of Object.entries(stored.additions)) {
             publish({ type: "blob-added", hash, blob });
           }
-          const thread = threads.attribute(seq, stored.messageAddresses);
-          // Only conversation is grouped into turns. A `count_tokens` request
-          // repeats a thread's messages to ask what they cost, which is not
-          // work in the turn they belong to, and an `other` request is one Tap
-          // cannot read at all: both stay ungrouped rather than being given an
-          // invented turn, and neither advances the count.
-          const turn = type === "messages" ? turns.attribute(thread, stored.finalMessage) : null;
+          // Attributed from the payload that was held, so the prefix a thread
+          // is derived from is the prefix the record can show.
+          const { thread, turn } = attribution.attribute(seq, type, stored);
           amend(
             { skeleton: stored.skeleton, thread, turn },
             { thread, turn, skeleton: stored.skeleton },
@@ -533,7 +538,7 @@ export function createRecord(options: RecordOptions = {}): Record {
       revision,
       lifecycle,
       requests: requests.map(copyRequest),
-      threads: threads.list(),
+      threads: attribution.threads(),
       blobs: blobs.map(),
       storage: storage(),
       evictions: [...evictions],
@@ -541,6 +546,212 @@ export function createRecord(options: RecordOptions = {}): Record {
     };
   }
 }
+
+/**
+ * Thread and turn, derived from one payload as the record holds it.
+ *
+ * Claude Code sends no conversation identifier and no turn boundary. What it
+ * does send is the whole conversation, every time: a request that continues a
+ * conversation repeats every message of it and adds to the end. Both
+ * derivations here read that one fact — lineage from the *prefix* a request
+ * shares with the requests before it, and the boundary between turns from the
+ * shape of the message on the end.
+ *
+ * Both are *inferences*, and neither claims more than the wire supports. Why
+ * a new prefix appeared — a subagent, a `/clear`, a `--resume`, a compaction
+ * that rewrote history — is not observable, so threads are numbered and never
+ * named: confident misattribution is worse than none. Nor is it observable
+ * whether a person was waiting for a request. A compaction rewrites history
+ * into a user message and looks turn-initial; a prompt queued during a tool
+ * loop arrives beside a tool result and does not. Both artefacts are accepted
+ * rather than guessed around, because the guess that would fix either one
+ * would have to claim something the wire cannot show. The cost of being wrong
+ * is bounded by what a turn is allowed to do: group the request list for
+ * reading. A misplaced boundary puts a divider in the wrong place, and can
+ * never hide, drop or reorder a request.
+ *
+ * Derived here, at capture, and once — which is ADR-0008. The rule reads the
+ * final message of a payload, and a reader of the record has that payload
+ * only as a skeleton whose units may have been evicted: a turn derived in the
+ * page would change when the record came under its cap, and two viewers of
+ * one record could read different turns from it.
+ */
+interface Attribution {
+  /**
+   * Where a held payload's request belongs: the lineage it continues, and the
+   * turn of that lineage it is part of.
+   *
+   * Total and synchronous, because it is called from the capture path.
+   */
+  attribute(seq: number, type: RequestType, stored: Stored): Attributed;
+  /** The threads seen, in order of first appearance. */
+  threads(): readonly Thread[];
+}
+
+/** What one payload said about where its request belongs. */
+interface Attributed {
+  readonly thread: number | null;
+  readonly turn: number | null;
+}
+
+function createAttribution(): Attribution {
+  /**
+   * Every prefix seen, by its rolling address, and the thread that had it.
+   *
+   * Grows with the conversation rather than with the requests carrying it —
+   * one entry per distinct message, at a fixed-size address each — and is not
+   * evicted with the blobs. A thread whose prefixes were dropped would
+   * fragment on its next request, which is a wrong answer where a heavier map
+   * is only a heavier map.
+   */
+  const seen = new Map<string, number>();
+  const threads: Thread[] = [];
+  /** The turn each thread is in, by thread id. Numbered from 1 within it. */
+  const currentTurn = new Map<number, number>();
+
+  /** A lineage nothing seen so far continues, numbered as it is opened. */
+  const openThread = (firstSeq: number): number => {
+    const id = threads.length + 1;
+    threads.push({ id, main: id === 1, firstSeq });
+    return id;
+  };
+
+  /**
+   * The lineage a request continues, given the addresses of its messages in
+   * wire order, or a thread opened for it when it continues nothing.
+   *
+   * Null when there is no prefix to derive one from: a request with no
+   * messages says nothing about lineage, and putting it in the main thread
+   * because it had to go somewhere would be an assertion the wire does not
+   * support.
+   */
+  const lineageOf = (seq: number, messages: readonly string[]): number | null => {
+    if (messages.length === 0) return null;
+
+    // Every prefix of this request is registered, not just the whole of it.
+    // That is what makes attribution independent of the order requests are
+    // assigned in: a long request assigned before the shorter one it
+    // continues still leaves the shorter one's prefix behind, so two threads
+    // interleaving on the wire attribute the same way either way round.
+    const prefixes: string[] = [];
+    let prefix = ROOT;
+    let found: number | undefined;
+    for (const message of messages) {
+      prefix = extend(prefix, message);
+      prefixes.push(prefix);
+      // The longest match wins, and the last one to match is the longest: a
+      // longer shared prefix is a more specific lineage.
+      found = seen.get(prefix) ?? found;
+    }
+
+    const thread = found ?? openThread(seq);
+    for (const each of prefixes) if (!seen.has(each)) seen.set(each, thread);
+    return thread;
+  };
+
+  /** The turn `thread` is in, once this request has been counted into it. */
+  const turnOf = (thread: number, finalMessage: string): number => {
+    const current = currentTurn.get(thread);
+    // A thread first seen mid-loop has no open turn to continue. Its first
+    // request is turn 1 of it either way: the turn it really continues was
+    // never captured, and numbering from 2 to leave a space for it would
+    // assert a request Tap never saw.
+    const turn = beginsTurn(finalMessage) ? (current ?? 0) + 1 : (current ?? 1);
+    currentTurn.set(thread, turn);
+    return turn;
+  };
+
+  return {
+    attribute(seq, type, stored) {
+      // The one ordering in here, and the reason the two derivations are one
+      // call rather than two. Registering prefixes is safe in any order —
+      // that is what `lineageOf` is built for — while counting turns is not:
+      // it advances a counter per thread, so a turn counted before its thread
+      // was settled, or against the thread that happened to come in last,
+      // would be a silently wrong number. The thread is settled first, and
+      // the turn is counted once, in the thread this request was just put in.
+      const thread = lineageOf(seq, stored.messageAddresses);
+      if (thread === null) return { thread, turn: null };
+
+      // Only conversation is counted into turns, and this is the only place
+      // the exclusion is written because it is the only place it is applied.
+      // A `count_tokens` request repeats a thread's messages to ask what they
+      // cost, which is not work the prompt set off, and giving it a turn
+      // would inflate every count a divider shows; an `other` request is one
+      // Tap cannot read at all. Both keep the thread their prefix earns them,
+      // stay ungrouped, and leave the count where it was.
+      if (type !== "messages") return { thread, turn: null };
+
+      // Read here and dropped here. `finalMessage` is a slice of the payload
+      // rather than a copy of it, so anything that held on to it would hold
+      // the whole payload alive — the failure `detach` exists to stop. What
+      // outlives this line is the number `turnOf` returns.
+      const { finalMessage } = stored;
+      // A payload with messages in it has a last one, so this stands for the
+      // type rather than for a case the record can reach.
+      if (finalMessage === null) return { thread, turn: null };
+      return { thread, turn: turnOf(thread, finalMessage) };
+    },
+
+    threads: () => [...threads],
+  };
+}
+
+/**
+ * Whether a request's final message opens a turn: it is the user's, and
+ * carries no tool result.
+ *
+ * Total, and false for anything it cannot read. A message that is not JSON,
+ * or not an object, or has no role, says nothing about a boundary — and
+ * false is the answer that costs least, because a missed boundary merges two
+ * turns a reader can still see every request of, while an invented one
+ * splits a tool loop that never paused.
+ */
+function beginsTurn(finalMessage: string): boolean {
+  let message: unknown;
+  try {
+    message = JSON.parse(finalMessage);
+  } catch {
+    return false;
+  }
+  if (typeof message !== "object" || message === null) return false;
+  const { role, content } = message as { role?: unknown; content?: unknown };
+  if (role !== "user") return false;
+  // A string content has no blocks in it, whatever the string says: the text
+  // "tool_result" is a person talking about tool results, not one arriving.
+  if (!Array.isArray(content)) return true;
+  return !content.some(
+    (block) =>
+      typeof block === "object" &&
+      block !== null &&
+      (block as { type?: unknown }).type === "tool_result",
+  );
+}
+
+/**
+ * The prefix of no messages. Never registered against a thread — every
+ * conversation has it, so matching on it would put every request in whichever
+ * thread happened to arrive first.
+ */
+const ROOT = "";
+
+/**
+ * The address of a prefix, from the address of the prefix before it and the
+ * address of the message that extends it.
+ *
+ * Rolled rather than accumulated so that extending a prefix costs one hash
+ * however long the conversation is, and so that what is held per prefix is a
+ * fixed-size string rather than the growing list of messages it stands for.
+ */
+function extend(prefix: string, message: string): string {
+  return createHash("sha256").update(prefix).update(SEPARATOR).update(message).digest("hex");
+}
+
+/**
+ * Between the two halves of a rolled address, so that the addresses being
+ * joined cannot run together into the same bytes as a different pair would.
+ */
+const SEPARATOR = "\n";
 
 function copyRequest(request: RecordedRequest): RecordedRequest {
   return {

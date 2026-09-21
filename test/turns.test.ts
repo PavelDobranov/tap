@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
 import { after, test } from "node:test";
 import { openUi, type Browser } from "./helpers/browser.ts";
-import { createRecord, type Record as RecordHandle } from "../src/record/record.ts";
-import { createTurns } from "../src/record/turns.ts";
+import {
+  createRecord,
+  type Record as RecordHandle,
+  type RecordedRequest,
+} from "../src/record/record.ts";
 import { startUi } from "../src/ui/server.ts";
 import { freePort, killAllSessions } from "./helpers/run-tap.ts";
 import { createProber, quit, responds } from "./helpers/session.ts";
@@ -11,11 +14,13 @@ import { createProber, quit, responds } from "./helpers/session.ts";
  * Turn derivation: reading the request list as prompts and the work each one
  * set off, from the shape of `messages[]` and nothing else.
  *
- * The unit tests work in final messages, because that is what the record
- * hands the deriver: a request begins a turn when its last message is from
- * the user and carries no tool result, and continues the current one
- * otherwise. The session and UI tests then drive the whole of it, from a
- * scripted conversation through to what a reader of the page sees.
+ * The unit tests drive the record, because that is where a turn is derived:
+ * a conversation goes in one request at a time, the way the wire has it —
+ * each request resending the whole of it — and the rows come out saying which
+ * turn of which thread each one was. A request begins a turn when its last
+ * message is from the user and carries no tool result, and continues the
+ * current one otherwise. The session and UI tests then drive the whole of it,
+ * from a scripted conversation through to what a reader of the page sees.
  *
  * Every turn here is an *inference*. The tests say what the rule does, and
  * two of them say what it gets wrong — a compaction that looks turn-initial,
@@ -27,117 +32,197 @@ const tap = createProber("turns");
 after(() => tap.dispose());
 after(killAllSessions);
 
+/** The payload of one scripted request: a whole conversation, as the wire has it. */
+const ask = (...messages: unknown[]): string =>
+  JSON.stringify({ model: "claude-opus-5", messages });
+
+const user = (content: unknown): unknown => ({ role: "user", content });
+const assistant = (content: unknown): unknown => ({ role: "assistant", content });
+const result = (id: string): unknown => ({ type: "tool_result", tool_use_id: id, content: "ok" });
+
 /** A user prompt: the shape that begins a turn. */
-const prompt = (text: string): string => JSON.stringify({ role: "user", content: text });
+const prompt = (text: string): unknown => user(text);
 
 /** A tool result going back to the model: the shape that continues one. */
-const toolResult = (id: string): string =>
-  JSON.stringify({
-    role: "user",
-    content: [{ type: "tool_result", tool_use_id: id, content: "done" }],
-  });
+const toolResult = (id: string): unknown => user([result(id)]);
 
-const answer = (text: string): string =>
-  JSON.stringify({ role: "assistant", content: [{ type: "text", text }] });
+/** One request as the record saw it: a payload in, the row it made out. */
+function attributed(
+  record: RecordHandle,
+  payload: string,
+  path = "/v1/messages",
+): RecordedRequest {
+  const entry = record.begin("POST", path);
+  entry.observePayload(payload);
+  return record.snapshot().requests[entry.seq - 1]!;
+}
+
+/**
+ * A conversation on the wire: each call adds a message and sends everything
+ * said so far, which is what Claude Code does and what both derivations read.
+ */
+function conversation(
+  record: RecordHandle,
+): (message: unknown, path?: string) => RecordedRequest {
+  const messages: unknown[] = [];
+  return (message, path) => {
+    messages.push(message);
+    return attributed(record, ask(...messages), path);
+  };
+}
 
 test("a user prompt with no tool result in it begins a turn, and the work after it continues", () => {
-  const turns = createTurns();
+  const send = conversation(createRecord());
 
-  assert.equal(turns.attribute(1, prompt("read the file")), 1);
-  assert.equal(turns.attribute(1, toolResult("toolu_read")), 1, "the tool loop is the same turn");
-  assert.equal(turns.attribute(1, toolResult("toolu_grep")), 1);
-  assert.equal(turns.attribute(1, prompt("now change it")), 2, "a fresh prompt is a fresh turn");
-  assert.equal(turns.attribute(1, toolResult("toolu_edit")), 2);
+  assert.equal(send(prompt("read the file")).turn, 1);
+  assert.equal(send(toolResult("toolu_read")).turn, 1, "the tool loop is the same turn");
+  assert.equal(send(toolResult("toolu_grep")).turn, 1);
+  assert.equal(send(prompt("now change it")).turn, 2, "a fresh prompt is a fresh turn");
+  assert.equal(send(toolResult("toolu_edit")).turn, 2);
 });
 
 test("a request whose last message is the assistant's continues the turn", () => {
-  const turns = createTurns();
+  const send = conversation(createRecord());
 
-  assert.equal(turns.attribute(1, prompt("hello")), 1);
+  assert.equal(send(prompt("hello")).turn, 1);
   assert.equal(
-    turns.attribute(1, answer("thinking")),
+    send(assistant([{ type: "text", text: "thinking" }])).turn,
     1,
     "only a user message can open a turn, whatever else is resent",
   );
 });
 
 test("ordinary user text is not confused for a tool result", () => {
-  const turns = createTurns();
+  const send = conversation(createRecord());
 
-  assert.equal(turns.attribute(1, prompt("read the file")), 1);
+  assert.equal(send(prompt("read the file")).turn, 1);
   assert.equal(
-    turns.attribute(1, prompt('what does "tool_result" mean?')),
+    send(prompt('what does "tool_result" mean?')).turn,
     2,
     "a string content has no blocks in it, whatever the string says",
   );
   assert.equal(
-    turns.attribute(1, JSON.stringify({ role: "user", content: [{ type: "text", text: "and now?" }] })),
+    send(user([{ type: "text", text: "and now?" }])).turn,
     3,
     "a block array with no tool result in it is a prompt like any other",
   );
   assert.equal(
-    turns.attribute(
-      1,
-      JSON.stringify({
-        role: "user",
-        content: [
-          { type: "tool_result", tool_use_id: "toolu_a", content: "done" },
-          { type: "text", text: "and while you are there" },
-        ],
-      }),
-    ),
+    send(user([result("toolu_a"), { type: "text", text: "and while you are there" }])).turn,
     3,
     "a prompt queued mid-loop carries a tool result, so the rule reads it as the same turn",
   );
 });
 
 test("turns are derived inside a thread and numbered in first-seen order there", () => {
-  const turns = createTurns();
+  const record = createRecord();
+  const main = conversation(record);
+  const elsewhere = conversation(record);
 
-  assert.equal(turns.attribute(1, prompt("main one")), 1);
-  assert.equal(turns.attribute(2, prompt("elsewhere one")), 1, "a thread counts from its own 1");
-  assert.equal(turns.attribute(1, toolResult("toolu_main")), 1);
-  assert.equal(turns.attribute(2, prompt("elsewhere two")), 2);
-  assert.equal(turns.attribute(1, prompt("main two")), 2, "and is unmoved by the other thread");
-  assert.equal(turns.attribute(3, toolResult("toolu_third")), 1);
+  assert.deepEqual(rowOf(main(prompt("main one"))), [1, 1]);
+  assert.deepEqual(
+    rowOf(elsewhere(prompt("elsewhere one"))),
+    [2, 1],
+    "a thread counts from its own 1",
+  );
+  assert.deepEqual(rowOf(main(toolResult("toolu_main"))), [1, 1]);
+  assert.deepEqual(rowOf(elsewhere(prompt("elsewhere two"))), [2, 2]);
+  assert.deepEqual(
+    rowOf(main(prompt("main two"))),
+    [1, 2],
+    "and is unmoved by the other thread",
+  );
 });
 
-test("a request with no thread to derive a turn in is left ungrouped", () => {
-  const turns = createTurns();
+/** The pair a row is read for here: which lineage, and which turn of it. */
+const rowOf = (request: RecordedRequest): (number | null)[] => [request.thread, request.turn];
 
-  assert.equal(turns.attribute(null, prompt("nowhere")), null);
-  assert.equal(turns.attribute(1, null), null, "and so is one with no final message");
-  assert.equal(turns.attribute(1, prompt("somewhere")), 1, "neither of which opened a turn");
+test("a request with no thread to derive a turn in is left ungrouped", () => {
+  const record = createRecord();
+
+  assert.deepEqual(
+    rowOf(attributed(record, JSON.stringify({ model: "claude-opus-5" }))),
+    [null, null],
+    "no messages, so no conversation to be a turn of",
+  );
+  assert.deepEqual(
+    rowOf(attributed(record, ask(prompt("nowhere")), "/v1/models")),
+    [null, null],
+    "and a request Tap does not read as conversation is not one either",
+  );
+  assert.deepEqual(
+    rowOf(attributed(record, ask(prompt("somewhere")))),
+    [1, 1],
+    "neither of which opened a turn",
+  );
+});
+
+test("a count_tokens request keeps its thread and never advances its turn", () => {
+  // It repeats the thread's messages to ask what they cost, which is not work
+  // the prompt set off. Giving it a turn would inflate every count a divider
+  // shows, so it is ungrouped and the count it would have advanced stays put.
+  const record = createRecord();
+  const first = prompt("read the file");
+  const second = prompt("now change it");
+
+  assert.deepEqual(rowOf(attributed(record, ask(first))), [1, 1]);
+  assert.deepEqual(
+    rowOf(attributed(record, ask(first, second), "/v1/messages/count_tokens")),
+    [1, null],
+    "the same lineage, and no turn of it",
+  );
+  assert.deepEqual(
+    rowOf(attributed(record, ask(first, second))),
+    [1, 2],
+    "and the prompt it was asked about is still the thread's second turn",
+  );
+});
+
+test("a request that opens a thread takes the first turn of that thread", () => {
+  // The ordering the two derivations are one call for: the thread is settled
+  // from the payload first, and the turn is counted in the thread this
+  // request was just put in. Counted before, or against the thread that came
+  // in last, this prompt would be the main conversation's turn 2.
+  const record = createRecord();
+  const main = conversation(record);
+
+  assert.deepEqual(rowOf(main(prompt("read the file"))), [1, 1]);
+  assert.deepEqual(rowOf(main(toolResult("toolu_read"))), [1, 1]);
+  assert.deepEqual(rowOf(attributed(record, ask(prompt("read the file, elsewhere")))), [2, 1]);
+  assert.deepEqual(
+    rowOf(main(prompt("now change it"))),
+    [1, 2],
+    "and the thread that was interrupted counts on from where it was",
+  );
 });
 
 test("a thread that is first seen mid-loop starts at its first request rather than at a guess", () => {
-  const turns = createTurns();
+  const send = conversation(createRecord());
 
   assert.equal(
-    turns.attribute(1, toolResult("toolu_first")),
+    send(toolResult("toolu_first")).turn,
     1,
     "the turn it continues was never captured, and inventing a boundary would not find it",
   );
-  assert.equal(turns.attribute(1, toolResult("toolu_second")), 1);
-  assert.equal(turns.attribute(1, prompt("next")), 2);
+  assert.equal(send(toolResult("toolu_second")).turn, 1);
+  assert.equal(send(prompt("next")).turn, 2);
 });
 
 test("a final message that cannot be read as one continues the turn rather than opening one", () => {
-  const turns = createTurns();
+  const record = createRecord();
+  const messages: unknown[] = [prompt("first")];
+  assert.deepEqual(rowOf(attributed(record, ask(...messages))), [1, 1]);
 
-  assert.equal(turns.attribute(1, prompt("first")), 1);
-  assert.equal(turns.attribute(1, "not json at all"), 1);
-  assert.equal(turns.attribute(1, JSON.stringify("a string, not a message")), 1);
-  assert.equal(turns.attribute(1, JSON.stringify({ content: "no role" })), 1);
+  // Not JSON at all. The payload is scanned for where its messages are rather
+  // than parsed, so a message-shaped span that will not parse still arrives
+  // here — and says nothing about a boundary.
+  const malformed = `{"model":"claude-opus-5","messages":[${JSON.stringify(messages[0])},nope]}`;
+  assert.deepEqual(rowOf(attributed(record, malformed)), [1, 1]);
+
+  messages.push("a string, not a message");
+  assert.deepEqual(rowOf(attributed(record, ask(...messages))), [1, 1]);
+  messages.push({ content: "no role" });
+  assert.deepEqual(rowOf(attributed(record, ask(...messages))), [1, 1]);
 });
-
-/** The payload of one scripted request: a whole conversation, as the wire has it. */
-const ask = (...messages: unknown[]): string =>
-  JSON.stringify({ model: "claude-opus-5", messages: messages.map((message) => message) });
-
-const user = (content: unknown): unknown => ({ role: "user", content });
-const assistant = (content: unknown): unknown => ({ role: "assistant", content });
-const result = (id: string): unknown => ({ type: "tool_result", tool_use_id: id, content: "ok" });
 
 test("a session's turns are derived from the conversation and served in the snapshot", async () => {
   const api = await tap.upstream(responds("{}"));
